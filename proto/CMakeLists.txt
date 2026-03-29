@@ -6,7 +6,7 @@ message(STATUS "protoc: ${PROTOC_EXECUTABLE}")
 message(STATUS "grpc_cpp_plugin: ${GRPC_CPP_PLUGIN}")
 
 # Корень proto-контрактов Финама (в сабмодуле)
-set(FINAM_PROTO_ROOT "${CMAKE_SOURCE_DIR}/vendor/finam-docs/contracts/proto")
+set(FINAM_PROTO_ROOT ${CMAKE_SOURCE_DIR}/vendor/finam-docs/contracts/proto)
 
 # Все .proto файлы из tradeapi/v1
 file(GLOB_RECURSE PROTO_FILES "${FINAM_PROTO_ROOT}/tradeapi/v1/*.proto")
@@ -16,8 +16,9 @@ if(NOT PROTO_FILES)
 endif()
 
 # Директория для сгенерированных файлов (внутри build/, не коммитим)
-set(PROTO_GEN_DIR "${CMAKE_BINARY_DIR}/generated/proto")
+set(PROTO_GEN_DIR ${CMAKE_BINARY_DIR}/generated/proto)
 file(MAKE_DIRECTORY ${PROTO_GEN_DIR})
+file(MAKE_DIRECTORY ${PROTO_GEN_DIR}/tradeapi/v1)
 
 set(PROTO_SRCS "")
 set(PROTO_HDRS "")
@@ -25,27 +26,24 @@ set(PROTO_HDRS "")
 foreach(PROTO_FILE ${PROTO_FILES})
     get_filename_component(PROTO_NAME ${PROTO_FILE} NAME_WE)
 
-    set(PB_CC   "${PROTO_GEN_DIR}/tradeapi/v1/${PROTO_NAME}.pb.cc")
-    set(PB_H    "${PROTO_GEN_DIR}/tradeapi/v1/${PROTO_NAME}.pb.h")
-    set(GRPC_CC "${PROTO_GEN_DIR}/tradeapi/v1/${PROTO_NAME}.grpc.pb.cc")
-    set(GRPC_H  "${PROTO_GEN_DIR}/tradeapi/v1/${PROTO_NAME}.grpc.pb.h")
+    set(PB_CC   ${PROTO_GEN_DIR}/tradeapi/v1/${PROTO_NAME}.pb.cc)
+    set(PB_H    ${PROTO_GEN_DIR}/tradeapi/v1/${PROTO_NAME}.pb.h)
+    set(GRPC_CC ${PROTO_GEN_DIR}/tradeapi/v1/${PROTO_NAME}.grpc.pb.cc)
+    set(GRPC_H  ${PROTO_GEN_DIR}/tradeapi/v1/${PROTO_NAME}.grpc.pb.h)
 
     list(APPEND PROTO_SRCS ${PB_CC} ${GRPC_CC})
     list(APPEND PROTO_HDRS ${PB_H}  ${GRPC_H})
 
-    # Создаём поддиректорию для вывода заранее
-    file(MAKE_DIRECTORY "${PROTO_GEN_DIR}/tradeapi/v1")
-
+    # Без кавычек вокруг путей — CMake сам обработает пробелы через VERBATIM
     add_custom_command(
         OUTPUT  ${PB_CC} ${PB_H} ${GRPC_CC} ${GRPC_H}
         COMMAND ${PROTOC_EXECUTABLE}
-            # --proto_path = корень, чтобы import "tradeapi/v1/common.proto" резолвился корректно
-            --proto_path="${FINAM_PROTO_ROOT}"
-            --cpp_out="${PROTO_GEN_DIR}"
-            --grpc_out="${PROTO_GEN_DIR}"
-            --plugin=protoc-gen-grpc="${GRPC_CPP_PLUGIN}"
-            "${PROTO_FILE}"
-        DEPENDS "${PROTO_FILE}"
+            --proto_path=${FINAM_PROTO_ROOT}
+            --cpp_out=${PROTO_GEN_DIR}
+            --grpc_out=${PROTO_GEN_DIR}
+            --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
+            ${PROTO_FILE}
+        DEPENDS ${PROTO_FILE}
         COMMENT "Generating protobuf/gRPC for ${PROTO_NAME}.proto"
         VERBATIM
     )
@@ -55,7 +53,7 @@ endforeach()
 add_library(finam_proto STATIC ${PROTO_SRCS} ${PROTO_HDRS})
 
 target_include_directories(finam_proto PUBLIC
-    ${PROTO_GEN_DIR}   # #include "tradeapi/v1/orders.pb.h" работает из любого модуля
+    ${PROTO_GEN_DIR}
 )
 
 target_link_libraries(finam_proto PUBLIC
