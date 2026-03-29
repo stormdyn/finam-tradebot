@@ -1,68 +1,69 @@
 #pragma once
+#include <atomic>
+#include <memory>
 #include <string>
 #include <string_view>
-#include <vector>
-#include <atomic>
 #include <thread>
-#include <memory>
-#include <functional>
+#include <chrono>
+#include <vector>
 #include "core/interfaces.hpp"
 
-// Forward-declare gRPC stubs to avoid heavy includes in headers
 namespace grpc { class Channel; }
-namespace proto::tradeapi::v1 { class AuthService; }
 
 namespace finam::auth {
 
-struct TokenManagerConfig {
-    std::string endpoint;              // "api.finam.ru:443"
-    std::string secret_token;          // from $FINAM_SECRET_TOKEN
+struct Config {
+    std::string endpoint;    // "api.finam.ru:443"
+    std::string secret;      // $FINAM_SECRET_TOKEN — никогда не логировать
     std::chrono::seconds rpc_timeout{10};
 };
 
-// Thread-safe JWT manager.
-// - Obtains JWT via AuthService.Auth(secret)
-// - Exposes jwt() — lock-free atomic read, safe from any thread
-// - Runs SubscribeJwtRenewal stream in background thread
-// - Fetches account_ids via TokenDetails after initial auth
+// JWT-менеджер для Finam Trade API v2 (новый API, tradeapi.finam.ru).
 //
-// Lifetime: create once, pass by shared_ptr everywhere.
+// Поток жизни:
+//   1. init()          — Auth(secret) → JWT, TokenDetails(jwt) → account_ids
+//   2. jwt()           — lock-free чтение из любого потока (hot path)
+//   3. channel()       — gRPC канал с встроенным JWT interceptor
+//   4. ~TokenManager() — останавливает renewal thread
+//
+// Thread-safety: jwt() — атомарный; channel() — immutable после init().
 class TokenManager {
 public:
-    explicit TokenManager(TokenManagerConfig cfg);
+    explicit TokenManager(Config cfg);
     ~TokenManager();
 
-    // Non-copyable, non-movable (owns background thread)
     TokenManager(const TokenManager&)            = delete;
     TokenManager& operator=(const TokenManager&) = delete;
 
-    // Blocking: connects, authenticates, fetches account_ids.
-    // Must be called before jwt() or account_ids().
+    // Блокирующий вызов. Обязателен перед всем остальным.
     [[nodiscard]] Result<void> init();
 
-    // Lock-free, safe to call from hot path.
-    [[nodiscard]] std::string jwt() const;
+    // Lock-free, безопасен из любого потока включая стратегию.
+    [[nodiscard]] std::string jwt() const noexcept;
 
-    // Available after init()
+    // gRPC канал — передавать в Stub конструкторы.
+    // JWT interceptor встроен — не нужно вручную добавлять заголовки.
+    [[nodiscard]] std::shared_ptr<grpc::Channel> channel() const noexcept;
+
+    // Список торговых счетов — доступен после init().
     [[nodiscard]] const std::vector<std::string>& account_ids() const noexcept;
 
-    // Injects Authorization header into gRPC metadata.
-    // Pass to CallCredentials or intercept manually.
-    [[nodiscard]] std::string auth_header() const;
+    // Первый счёт — удобный хелпер.
+    [[nodiscard]] std::string_view primary_account_id() const;
 
-    // Stops the renewal background thread.
     void shutdown() noexcept;
 
 private:
-    Result<void> do_auth();
-    Result<void> fetch_account_ids();
-    void         run_renewal_stream();   // runs in thread_
+    [[nodiscard]] Result<void> do_auth();
+    [[nodiscard]] Result<void> fetch_account_ids();
+    void run_renewal_stream();  // фоновый поток
 
-    TokenManagerConfig              cfg_;
-    std::shared_ptr<grpc::Channel>  channel_;
+    void store_jwt(std::string jwt);
 
-    // Atomic string for lock-free JWT reads from strategy/order threads
-    // We store as shared_ptr<const string> behind atomic to avoid data races
+    Config cfg_;
+    std::shared_ptr<grpc::Channel> channel_;
+
+    // shared_ptr<const string> за atomic — lock-free читатели, нет data race
     std::atomic<std::shared_ptr<const std::string>> jwt_;
 
     std::vector<std::string> account_ids_;

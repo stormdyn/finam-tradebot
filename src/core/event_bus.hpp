@@ -1,60 +1,68 @@
 #pragma once
-// Lightweight SPSC event bus.
-// Producer: MarketDataClient (gRPC thread)
-// Consumer: Strategy engine (main loop)
-//
-// Uses a fixed-size ring buffer; no heap allocation in hot path.
-// If the ring is full, the oldest event is overwritten (lossy — acceptable
-// for quotes, use larger capacity if needed).
-
 #include <atomic>
 #include <array>
 #include <optional>
-#include <cstddef>
 #include <variant>
-#include "interfaces.hpp"
+#include "core/interfaces.hpp"
 
 namespace finam {
 
-// Event variant — extend when adding new event types
-using Event = std::variant<Quote, Bar, OrderUpdate>;
+// ── Event = всё что может прийти с рынка или от брокера ──────────────────────
+using MarketEvent = std::variant<Quote, Bar, OrderBook, OrderUpdate>;
 
+// ── SPSC lock-free кольцевой буфер ───────────────────────────────────────────
+// Producer: MD-поток (gRPC stream reader)
+// Consumer: Strategy-поток (event loop)
+//
+// Capacity должен быть степенью двойки — маска вместо модуля.
+// Cacheline padding между head/tail — устраняет false sharing.
+//
 template<std::size_t Capacity>
-class SPSCEventBus {
-static_assert((Capacity & (Capacity - 1)) == 0,
-              "Capacity must be a power of 2");
+    requires (Capacity >= 2 && (Capacity & (Capacity - 1)) == 0)  // pow2
+class SPSCQueue {
 public:
-    // Producer side — called from gRPC thread
-    void push(Event ev) noexcept {
+    // Возвращает false если буфер полон (producer dropped event — логируй!)
+    bool push(MarketEvent event) noexcept {
         const auto head = head_.load(std::memory_order_relaxed);
-        buffer_[head & kMask] = std::move(ev);
-        head_.store(head + 1, std::memory_order_release);
+        const auto next = (head + 1) & kMask;
+
+        if (next == tail_.load(std::memory_order_acquire))
+            return false;  // full
+
+        buffer_[head] = std::move(event);
+        head_.store(next, std::memory_order_release);
+        return true;
     }
 
-    // Consumer side — called from strategy thread
-    [[nodiscard]] std::optional<Event> pop() noexcept {
+    // Возвращает nullopt если буфер пуст
+    [[nodiscard]] std::optional<MarketEvent> pop() noexcept {
         const auto tail = tail_.load(std::memory_order_relaxed);
+
         if (tail == head_.load(std::memory_order_acquire))
-            return std::nullopt;
-        auto ev = std::move(buffer_[tail & kMask]);
-        tail_.store(tail + 1, std::memory_order_release);
-        return ev;
+            return std::nullopt;  // empty
+
+        auto event = std::move(buffer_[tail]);
+        tail_.store((tail + 1) & kMask, std::memory_order_release);
+        return event;
     }
 
     [[nodiscard]] bool empty() const noexcept {
-        return tail_.load(std::memory_order_acquire) ==
-               head_.load(std::memory_order_acquire);
+        return tail_.load(std::memory_order_acquire)
+            == head_.load(std::memory_order_acquire);
     }
 
 private:
     static constexpr std::size_t kMask = Capacity - 1;
 
+    // Padding между head и tail — разные cacheline, нет false sharing
     alignas(64) std::atomic<std::size_t> head_{0};
     alignas(64) std::atomic<std::size_t> tail_{0};
-    std::array<Event, Capacity>          buffer_{};
+
+    std::array<MarketEvent, Capacity> buffer_;
 };
 
-// Default bus: 4096 events (~256 KB for Quote-heavy workloads)
-using DefaultEventBus = SPSCEventBus<4096>;
+// ── Конкретный тип шины для бота ──────────────────────────────────────────────
+// 1024 событий = ~40KB при sizeof(MarketEvent)≈40 байт — влезает в L2
+using EventBus = SPSCQueue<1024>;
 
 } // namespace finam

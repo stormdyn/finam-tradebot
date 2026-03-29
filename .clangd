@@ -1,0 +1,13 @@
+CompileFlags:
+  Add:
+    - "-DSPDLOG_FMT_EXTERNAL"
+    - "-Wno-error"
+
+Diagnostics:
+  ClangTidy:
+    Remove:
+      - "*"
+  Suppress:
+    - "consteval*"
+    - "call to consteval*"
+    - "not a constant expression"

@@ -1,13 +1,10 @@
 [requires]
-grpc/1.67.1
-spdlog/1.12.0
+spdlog/1.13.0
 nlohmann_json/3.11.3
-abseil/20240116.2
-gtest/1.14.0
 
 [generators]
 CMakeDeps
 CMakeToolchain
 
-[layout]
-cmake_layout
+[tool_requires]
+cmake/[>=3.25]

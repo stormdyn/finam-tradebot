@@ -2,28 +2,24 @@
 #include <string>
 #include <string_view>
 #include <expected>
-#include <functional>
 #include <chrono>
 #include <cstdint>
-
 namespace finam {
 
-// ─── Error types ─────────────────────────────────────────────────────────────
+// ── Ошибки ────────────────────────────────────────────────────────────────────
 
 enum class ErrorCode : uint32_t {
     Ok = 0,
-    // Auth
-    AuthFailed,
-    JwtExpired,
-    JwtRefreshFailed,
-    // Network
+    // Network / gRPC
     ConnectionFailed,
     StreamDisconnected,
     Timeout,
+    RpcError,
     // Order
     OrderRejected,
     InsufficientMargin,
     InvalidPrice,
+    InvalidQuantity,
     // Risk
     RiskLimitExceeded,
     DailyLossLimitHit,
@@ -34,105 +30,132 @@ enum class ErrorCode : uint32_t {
 };
 
 struct Error {
-    ErrorCode   code;
+    ErrorCode   code{ErrorCode::Ok};
     std::string message;
 
-    [[nodiscard]] static Error ok() noexcept {
-        return {ErrorCode::Ok, {}};
-    }
+    [[nodiscard]] static Error ok() noexcept { return {}; }
     [[nodiscard]] bool is_ok() const noexcept { return code == ErrorCode::Ok; }
 };
 
 template<typename T>
 using Result = std::expected<T, Error>;
 
-// ─── Market data events ───────────────────────────────────────────────────────
+// ── Базовые типы ──────────────────────────────────────────────────────────────
 
 using Timestamp = std::chrono::system_clock::time_point;
 
+// Идентификатор инструмента — именно так в API v2
+struct Symbol {
+    std::string security_code;   // "Si", "RTS", "GOLD"
+    std::string security_board;  // "FUT" для FORTS фьючерсов
+
+    [[nodiscard]] std::string to_string() const {
+        return security_code + "@" + security_board;
+    }
+    [[nodiscard]] bool operator==(const Symbol&) const = default;
+};
+
+// ── Рыночные данные ───────────────────────────────────────────────────────────
+
 struct Quote {
-    std::string symbol;
-    double      bid{};
-    double      ask{};
-    double      last{};
-    int64_t     volume{};
-    Timestamp   ts;
+    Symbol    symbol;
+    double    bid{};
+    double    ask{};
+    double    last{};
+    int64_t   volume{};
+    Timestamp ts;
 };
 
 struct Bar {
-    std::string symbol;
-    double      open{}, high{}, low{}, close{};
-    int64_t     volume{};
-    Timestamp   ts;
+    Symbol    symbol;
+    double    open{}, high{}, low{}, close{};
+    int64_t   volume{};
+    Timestamp ts;
 };
 
-// ─── Order/execution events ───────────────────────────────────────────────────
+struct OrderBookRow {
+    double  price{};
+    int64_t quantity{};
+};
+
+struct OrderBook {
+    Symbol                   symbol;
+    std::vector<OrderBookRow> asks;  // по возрастанию цены
+    std::vector<OrderBookRow> bids;  // по убыванию цены
+    Timestamp                ts;
+};
+
+// ── Ордера ────────────────────────────────────────────────────────────────────
 
 enum class OrderSide   { Buy, Sell };
 enum class OrderStatus { Pending, PartialFill, Filled, Cancelled, Rejected };
+enum class OrderType   { Market, Limit };
 
 struct OrderUpdate {
-    std::string  order_id;
-    std::string  symbol;
-    OrderSide    side{};
-    OrderStatus  status{};
-    double       price{};
-    int64_t      qty_total{};
-    int64_t      qty_filled{};
-    Timestamp    ts;
+    int64_t     order_no{};       // биржевой номер (появляется после попадания в стакан)
+    int32_t     transaction_id{}; // наш ID транзакции
+    Symbol      symbol;
+    std::string client_id;        // торговый счёт
+    OrderSide   side{};
+    OrderStatus status{};
+    OrderType   type{};
+    double      price{};
+    int32_t     qty_total{};
+    int32_t     qty_filled{};
+    std::string message;          // причина отказа если Rejected
+    Timestamp   ts;
 };
 
-// ─── Strategy signal ──────────────────────────────────────────────────────────
+// ── Сигнал стратегии ──────────────────────────────────────────────────────────
 
 struct Signal {
     enum class Direction { Buy, Sell, Close, None };
-    std::string symbol;
+
+    Symbol      symbol;
     Direction   direction{Direction::None};
-    double      price{};      // 0 = market order
-    int64_t     quantity{};
-    std::string reason;       // human-readable, for logs
+    OrderType   order_type{OrderType::Market};
+    double      price{};      // игнорируется при Market
+    int32_t     quantity{};
+    std::string reason;       // для логов, не для API
 };
 
-// ─── Interfaces ───────────────────────────────────────────────────────────────
+// ── Запрос на выставление ордера ──────────────────────────────────────────────
+
+struct OrderRequest {
+    std::string client_id;    // торговый счёт из GetAccounts
+    Symbol      symbol;
+    OrderSide   side{};
+    OrderType   type{OrderType::Market};
+    double      price{};      // только для Limit
+    int32_t     quantity{};
+};
+
+// ── Интерфейсы компонентов ────────────────────────────────────────────────────
 
 class IStrategy {
 public:
     virtual ~IStrategy() = default;
 
-    // Called on each new bar (e.g. 1-min candle)
-    virtual Signal on_bar(const Bar& bar) = 0;
+    virtual Signal on_bar(const Bar& bar)                    = 0;
+    virtual Signal on_quote(const Quote& quote)              = 0;
+    virtual void   on_order_update(const OrderUpdate& upd)   = 0;
 
-    // Called on each L1 quote update
-    virtual Signal on_quote(const Quote& quote) = 0;
-
-    // Called when an order status changes
-    virtual void on_order_update(const OrderUpdate& update) = 0;
-
-    // Strategy name for logging
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
-};
-
-struct OrderRequest {
-    std::string  account_id;
-    std::string  symbol;
-    OrderSide    side{};
-    double       price{};     // 0 = market
-    int64_t      quantity{};
-    bool         is_market{false};
 };
 
 class IOrderExecutor {
 public:
     virtual ~IOrderExecutor() = default;
-    virtual Result<std::string> submit(const OrderRequest& req) = 0;
-    virtual Result<void>        cancel(std::string_view order_id) = 0;
+
+    // Возвращает transaction_id
+    virtual Result<int32_t> submit(const OrderRequest& req)      = 0;
+    virtual Result<void>    cancel(int64_t order_no,
+                                   std::string_view client_id)   = 0;
 };
 
 class IRiskManager {
 public:
     virtual ~IRiskManager() = default;
-
-    // Returns Ok or RiskLimitExceeded / InsufficientMargin
     virtual Result<void> check(const OrderRequest& req) = 0;
 };
 
