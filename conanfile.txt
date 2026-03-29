@@ -1,0 +1,14 @@
+[requires]
+grpc/1.54.3
+protobuf/3.21.12
+spdlog/1.12.0
+nlohmann_json/3.11.3
+abseil/20230125.3
+gtest/1.14.0
+
+[generators]
+CMakeDeps
+CMakeToolchain
+
+[layout]
+cmake_layout

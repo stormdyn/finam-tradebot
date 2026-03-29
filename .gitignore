@@ -1,0 +1,16 @@
+# Артефакты сборки
+build/
+.cache/
+
+# Conan
+.conan/
+
+# Секрет
+.env
+*.key
+*.pem
+
+# IDE
+.vscode/
+.idea/
+*.swp
