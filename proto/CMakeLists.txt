@@ -1,28 +1,27 @@
-# ── protoc: берём из Conan-кэша рядом с libprotobuf ─────────────────────────
-# get_target_property(IMPORTED_LOCATION) не раскрывает generator expressions,
-# поэтому берём INTERFACE_INCLUDE_DIRECTORIES и идём на уровень выше в bin/
-get_target_property(_pb_iface protobuf::libprotobuf INTERFACE_INCLUDE_DIRECTORIES)
-# Первый элемент — путь вида .../p/include или genex
-string(REGEX REPLACE "[\$<>a-zA-Z_:]+" "" _pb_include_raw "${_pb_iface}")
-string(STRIP "${_pb_include_raw}" _pb_include)
-# Получаем .../p/ из .../p/include
-get_filename_component(_pb_prefix "${_pb_include}" DIRECTORY)
-
-find_program(PROTOC_EXECUTABLE
-    NAMES protoc
-    HINTS "${_pb_prefix}/bin"
-    NO_DEFAULT_PATH
-    REQUIRED
-)
+# ── gRPC plugin ───────────────────────────────────────────────────────────────────
 get_target_property(GRPC_CPP_PLUGIN gRPC::grpc_cpp_plugin IMPORTED_LOCATION)
+message(STATUS "grpc_cpp_plugin: ${GRPC_CPP_PLUGIN}")
 
-message(STATUS "protoc (Conan):   ${PROTOC_EXECUTABLE}")
-message(STATUS "grpc_cpp_plugin:  ${GRPC_CPP_PLUGIN}")
+# protoc: $<TARGET_FILE:protobuf::protoc> — generator expression,
+# раскрывается в build-time, не в configure-time — это нормально.
+# COMMAND в add_custom_command поддерживает genex напрямую.
+set(PROTOC "$<TARGET_FILE:protobuf::protoc>")
 
 # ── Пути ────────────────────────────────────────────────────────────────────
 set(FINAM_PROTO_ROOT ${CMAKE_SOURCE_DIR}/vendor/finam-docs/contracts)
-set(PROTOBUF_INCLUDE_DIR "${_pb_prefix}/include")
-message(STATUS "Protobuf include:  ${PROTOBUF_INCLUDE_DIR}")
+
+# well-known types: protobuf-module.cmake уже выставляет Protobuf_INCLUDE_DIR
+if(NOT Protobuf_INCLUDE_DIR)
+    get_target_property(_pb_dirs protobuf::libprotobuf INTERFACE_INCLUDE_DIRECTORIES)
+    # Берём первый реальный путь (не genex) из списка
+    foreach(_d IN LISTS _pb_dirs)
+        if(NOT _d MATCHES "^\\$<" AND IS_DIRECTORY "${_d}")
+            set(Protobuf_INCLUDE_DIR "${_d}")
+            break()
+        endif()
+    endforeach()
+endif()
+message(STATUS "Protobuf include: ${Protobuf_INCLUDE_DIR}")
 
 set(PROTO_GEN_DIR ${CMAKE_BINARY_DIR}/generated/proto)
 file(MAKE_DIRECTORY ${PROTO_GEN_DIR}/proto/tradeapi/v1)
@@ -31,7 +30,7 @@ file(MAKE_DIRECTORY ${PROTO_GEN_DIR}/google/type)
 # ── Базовые аргументы protoc ─────────────────────────────────────────────────
 set(PROTOC_BASE_ARGS
     --proto_path=${FINAM_PROTO_ROOT}
-    --proto_path=${PROTOBUF_INCLUDE_DIR}
+    --proto_path=${Protobuf_INCLUDE_DIR}
     --cpp_out=${PROTO_GEN_DIR}
     --grpc_out=${PROTO_GEN_DIR}
     --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
@@ -53,9 +52,9 @@ set(DATE_PB_H  ${PROTO_GEN_DIR}/google/type/date.pb.h)
 
 add_custom_command(
     OUTPUT  ${DATE_PB_CC} ${DATE_PB_H}
-    COMMAND ${PROTOC_EXECUTABLE}
+    COMMAND ${PROTOC}
             --proto_path=${FINAM_PROTO_ROOT}
-            --proto_path=${PROTOBUF_INCLUDE_DIR}
+            --proto_path=${Protobuf_INCLUDE_DIR}
             --cpp_out=${PROTO_GEN_DIR}
             ${DATE_PROTO}
     DEPENDS ${DATE_PROTO}
@@ -84,7 +83,7 @@ foreach(PROTO_FILE ${PROTO_FILES})
     list(APPEND PROTO_HDRS ${PB_H}  ${GRPC_H})
     add_custom_command(
         OUTPUT  ${PB_CC} ${PB_H} ${GRPC_CC} ${GRPC_H}
-        COMMAND ${PROTOC_EXECUTABLE} ${PROTOC_BASE_ARGS} ${PROTO_FILE}
+        COMMAND ${PROTOC} ${PROTOC_BASE_ARGS} ${PROTO_FILE}
         DEPENDS ${PROTO_FILE} ${DATE_PB_H}
         COMMENT "Generating protobuf/gRPC for ${PROTO_NAME}.proto"
         VERBATIM
