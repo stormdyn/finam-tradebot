@@ -1,0 +1,3 @@
+[submodule "vendor/finam-docs"]
+	path = vendor/finam-docs
+	url = https://github.com/FinamWeb/trade-api-docs.git
