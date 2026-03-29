@@ -1,36 +1,48 @@
 # ── gRPC plugin ───────────────────────────────────────────────────────────────────
 get_target_property(GRPC_CPP_PLUGIN gRPC::grpc_cpp_plugin IMPORTED_LOCATION)
-message(STATUS "grpc_cpp_plugin: ${GRPC_CPP_PLUGIN}")
 
-# protoc: $<TARGET_FILE:protobuf::protoc> — generator expression,
-# раскрывается в build-time, не в configure-time — это нормально.
-# COMMAND в add_custom_command поддерживает genex напрямую.
-set(PROTOC "$<TARGET_FILE:protobuf::protoc>")
+# ── protoc из Conan-кэша ───────────────────────────────────────────────────────────
+# Симлинк protoc в Conan не является regular file, поэтому find_program(... -type f) его не находит.
+# Ищем реальный бинарь protoc-XX.0.0 рядом с libprotobuf.
+# protobuf-conan-protoc-target.cmake уже знает путь — берём его из LOCATION таргета protobuf::protoc.
+# Для этого используем cmake -E env + execute_process через знакомый путь из Conan-модуля.
+get_target_property(_protoc_loc protobuf::protoc IMPORTED_LOCATION_RELEASE)
+if(NOT _protoc_loc)
+    get_target_property(_protoc_loc protobuf::protoc IMPORTED_LOCATION)
+endif()
+if(NOT _protoc_loc OR _protoc_loc MATCHES "NOTFOUND")
+    # Фоллбак: ищем реальный бинарь protoc-*.0.0 в Conan
+    file(GLOB _protoc_candidates
+        "$ENV{HOME}/.conan2/p/b/proto*/p/bin/protoc-[0-9]*.0.0"
+        "$ENV{HOME}/.conan2/p/proto*/p/bin/protoc-[0-9]*.0.0"
+    )
+    if(_protoc_candidates)
+        list(GET _protoc_candidates 0 _protoc_loc)
+    endif()
+endif()
+if(NOT _protoc_loc OR NOT EXISTS "${_protoc_loc}")
+    message(FATAL_ERROR "Cannot find Conan protoc. Expected at ~/.conan2/p/b/proto*/p/bin/protoc-*.0.0")
+endif()
+set(PROTOC_EXECUTABLE "${_protoc_loc}")
+
+# ── Protobuf include (берём из того же Conan-пакета) ──────────────────────────
+get_filename_component(_protoc_bin_dir "${PROTOC_EXECUTABLE}" DIRECTORY)  # .../bin
+get_filename_component(_pb_prefix     "${_protoc_bin_dir}"   DIRECTORY)  # .../p
+set(PROTOBUF_INCLUDE_DIR "${_pb_prefix}/include")
+
+message(STATUS "protoc (Conan):   ${PROTOC_EXECUTABLE}")
+message(STATUS "Protobuf include: ${PROTOBUF_INCLUDE_DIR}")
+message(STATUS "grpc_cpp_plugin:  ${GRPC_CPP_PLUGIN}")
 
 # ── Пути ────────────────────────────────────────────────────────────────────
 set(FINAM_PROTO_ROOT ${CMAKE_SOURCE_DIR}/vendor/finam-docs/contracts)
-
-# well-known types: protobuf-module.cmake уже выставляет Protobuf_INCLUDE_DIR
-if(NOT Protobuf_INCLUDE_DIR)
-    get_target_property(_pb_dirs protobuf::libprotobuf INTERFACE_INCLUDE_DIRECTORIES)
-    # Берём первый реальный путь (не genex) из списка
-    foreach(_d IN LISTS _pb_dirs)
-        if(NOT _d MATCHES "^\\$<" AND IS_DIRECTORY "${_d}")
-            set(Protobuf_INCLUDE_DIR "${_d}")
-            break()
-        endif()
-    endforeach()
-endif()
-message(STATUS "Protobuf include: ${Protobuf_INCLUDE_DIR}")
-
-set(PROTO_GEN_DIR ${CMAKE_BINARY_DIR}/generated/proto)
+set(PROTO_GEN_DIR    ${CMAKE_BINARY_DIR}/generated/proto)
 file(MAKE_DIRECTORY ${PROTO_GEN_DIR}/proto/tradeapi/v1)
 file(MAKE_DIRECTORY ${PROTO_GEN_DIR}/google/type)
 
-# ── Базовые аргументы protoc ─────────────────────────────────────────────────
 set(PROTOC_BASE_ARGS
     --proto_path=${FINAM_PROTO_ROOT}
-    --proto_path=${Protobuf_INCLUDE_DIR}
+    --proto_path=${PROTOBUF_INCLUDE_DIR}
     --cpp_out=${PROTO_GEN_DIR}
     --grpc_out=${PROTO_GEN_DIR}
     --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
@@ -52,9 +64,9 @@ set(DATE_PB_H  ${PROTO_GEN_DIR}/google/type/date.pb.h)
 
 add_custom_command(
     OUTPUT  ${DATE_PB_CC} ${DATE_PB_H}
-    COMMAND ${PROTOC}
+    COMMAND ${PROTOC_EXECUTABLE}
             --proto_path=${FINAM_PROTO_ROOT}
-            --proto_path=${Protobuf_INCLUDE_DIR}
+            --proto_path=${PROTOBUF_INCLUDE_DIR}
             --cpp_out=${PROTO_GEN_DIR}
             ${DATE_PROTO}
     DEPENDS ${DATE_PROTO}
@@ -63,9 +75,7 @@ add_custom_command(
 )
 
 # ── 2. proto/tradeapi/v1/*.pb.{h,cc} ──────────────────────────────────────────────
-file(GLOB_RECURSE PROTO_FILES
-    "${FINAM_PROTO_ROOT}/proto/tradeapi/v1/*.proto"
-)
+file(GLOB_RECURSE PROTO_FILES "${FINAM_PROTO_ROOT}/proto/tradeapi/v1/*.proto")
 if(NOT PROTO_FILES)
     message(FATAL_ERROR "No .proto files in ${FINAM_PROTO_ROOT}/proto/tradeapi/v1/")
 endif()
@@ -83,7 +93,7 @@ foreach(PROTO_FILE ${PROTO_FILES})
     list(APPEND PROTO_HDRS ${PB_H}  ${GRPC_H})
     add_custom_command(
         OUTPUT  ${PB_CC} ${PB_H} ${GRPC_CC} ${GRPC_H}
-        COMMAND ${PROTOC} ${PROTOC_BASE_ARGS} ${PROTO_FILE}
+        COMMAND ${PROTOC_EXECUTABLE} ${PROTOC_BASE_ARGS} ${PROTO_FILE}
         DEPENDS ${PROTO_FILE} ${DATE_PB_H}
         COMMENT "Generating protobuf/gRPC for ${PROTO_NAME}.proto"
         VERBATIM
