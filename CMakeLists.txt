@@ -20,7 +20,6 @@ target_compile_options(project_warnings INTERFACE
     -Wformat=2 -Wshadow
 )
 
-# Подключение директорий (создадим их на следующем шаге)
 add_subdirectory(proto)
-# add_subdirectory(src)
+add_subdirectory(src)
 # add_subdirectory(tests)
