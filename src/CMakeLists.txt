@@ -1,15 +1,16 @@
 add_subdirectory(core)
 add_subdirectory(auth)
+add_subdirectory(market_data)
 
-add_executable(finam_bot main.cpp)
+add_executable(finam_tradebot main.cpp)
 
-target_link_libraries(finam_bot PRIVATE
+target_link_libraries(finam_tradebot PRIVATE
     finam_core
     finam_auth
-    finam_proto
+    finam_market_data            
     spdlog::spdlog
 )
 
-target_link_libraries(finam_bot PRIVATE project_warnings)
-
-target_compile_definitions(finam_bot PRIVATE SPDLOG_FMT_EXTERNAL)
+target_include_directories(finam_tradebot PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
