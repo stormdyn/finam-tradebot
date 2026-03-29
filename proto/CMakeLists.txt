@@ -1,39 +1,58 @@
-# Используем системный protoc — он должен совпадать с версией libprotobuf из Conan
-# protoc 33.1 == protobuf 5.29.x
-find_program(PROTOC_EXECUTABLE protoc REQUIRED)
+# ── protoc из Conan (та же версия что libprotobuf) ──────────────────────────
+get_target_property(PROTOC_EXECUTABLE protobuf::protoc IMPORTED_LOCATION)
+if(NOT PROTOC_EXECUTABLE)
+    message(FATAL_ERROR "protobuf::protoc target has no IMPORTED_LOCATION. Run conan install first.")
+endif()
 get_target_property(GRPC_CPP_PLUGIN gRPC::grpc_cpp_plugin IMPORTED_LOCATION)
 
-message(STATUS "protoc:          ${PROTOC_EXECUTABLE}")
-message(STATUS "grpc_cpp_plugin: ${GRPC_CPP_PLUGIN}")
+message(STATUS "protoc (Conan):   ${PROTOC_EXECUTABLE}")
+message(STATUS "grpc_cpp_plugin:  ${GRPC_CPP_PLUGIN}")
 
-# Финам: import "proto/tradeapi/v1/common.proto"
-# => proto_path = contracts/ (родитель папки proto/)
+# ── Пути ────────────────────────────────────────────────────────────────────
+# contracts/ — корень: содержит proto/tradeapi/v1/*.proto и google/type/date.proto
 set(FINAM_PROTO_ROOT ${CMAKE_SOURCE_DIR}/vendor/finam-docs/contracts)
 
-# well-known types (google/protobuf/timestamp.proto) из Conan
-find_path(PROTOBUF_INCLUDE_DIR google/protobuf/timestamp.proto
-    HINTS ${CONAN_INCLUDE_DIRS}
-    PATH_SUFFIXES include
-    NO_DEFAULT_PATH
+# well-known types из Conan (google/protobuf/timestamp.proto и т.д.)
+get_target_property(PROTOBUF_INCLUDE_DIR protobuf::libprotobuf
+    INTERFACE_INCLUDE_DIRECTORIES)
+list(GET PROTOBUF_INCLUDE_DIR 0 PROTOBUF_INCLUDE_DIR)
+message(STATUS "Protobuf include:  ${PROTOBUF_INCLUDE_DIR}")
+
+set(PROTO_GEN_DIR ${CMAKE_BINARY_DIR}/generated/proto)
+file(MAKE_DIRECTORY ${PROTO_GEN_DIR}/proto/tradeapi/v1)
+file(MAKE_DIRECTORY ${PROTO_GEN_DIR}/google/type)
+
+# ── Базовые аргументы protoc ─────────────────────────────────────────────────
+set(PROTOC_BASE_ARGS
+    --proto_path=${FINAM_PROTO_ROOT}
+    --proto_path=${PROTOBUF_INCLUDE_DIR}
+    --cpp_out=${PROTO_GEN_DIR}
+    --grpc_out=${PROTO_GEN_DIR}
+    --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
 )
-if(NOT PROTOBUF_INCLUDE_DIR)
-    file(GLOB_RECURSE _TS_PROTO
-        "$ENV{HOME}/.conan2/p/b/proto*/p/include/google/protobuf/timestamp.proto"
-        "$ENV{HOME}/.conan2/p/proto*/p/include/google/protobuf/timestamp.proto"
-    )
-    if(_TS_PROTO)
-        list(GET _TS_PROTO 0 _first)
-        cmake_path(GET _first PARENT_PATH _d)
-        cmake_path(GET _d PARENT_PATH _d)
-        cmake_path(GET _d PARENT_PATH PROTOBUF_INCLUDE_DIR)
-    endif()
+
+# ── 1. Генерируем google/type/date.pb.{h,cc} ─────────────────────────────────
+set(DATE_PROTO ${FINAM_PROTO_ROOT}/google/type/date.proto)
+set(DATE_PB_CC ${PROTO_GEN_DIR}/google/type/date.pb.cc)
+set(DATE_PB_H  ${PROTO_GEN_DIR}/google/type/date.pb.h)
+
+if(NOT EXISTS ${DATE_PROTO})
+    message(FATAL_ERROR "Missing: ${DATE_PROTO}\nRun: mkdir -p vendor/finam-docs/contracts/google/type && curl -Lo vendor/finam-docs/contracts/google/type/date.proto https://raw.githubusercontent.com/googleapis/googleapis/master/google/type/date.proto")
 endif()
-message(STATUS "Protobuf well-known: ${PROTOBUF_INCLUDE_DIR}")
 
-# googleapis (google/type/date.proto) — лежит в vendor/ после curl
-set(GOOGLEAPIS_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/vendor/finam-docs/contracts)
-message(STATUS "googleapis:          ${GOOGLEAPIS_INCLUDE_DIR}")
+add_custom_command(
+    OUTPUT  ${DATE_PB_CC} ${DATE_PB_H}
+    COMMAND ${PROTOC_EXECUTABLE}
+            --proto_path=${FINAM_PROTO_ROOT}
+            --proto_path=${PROTOBUF_INCLUDE_DIR}
+            --cpp_out=${PROTO_GEN_DIR}
+            ${DATE_PROTO}
+    DEPENDS ${DATE_PROTO}
+    COMMENT "Generating google/type/date.pb"
+    VERBATIM
+)
 
+# ── 2. Генерируем proto/tradeapi/v1/*.pb.{h,cc} ──────────────────────────────
 file(GLOB_RECURSE PROTO_FILES
     "${FINAM_PROTO_ROOT}/proto/tradeapi/v1/*.proto"
 )
@@ -41,11 +60,8 @@ if(NOT PROTO_FILES)
     message(FATAL_ERROR "No .proto files found in ${FINAM_PROTO_ROOT}/proto/tradeapi/v1/")
 endif()
 
-set(PROTO_GEN_DIR ${CMAKE_BINARY_DIR}/generated/proto)
-file(MAKE_DIRECTORY ${PROTO_GEN_DIR}/proto/tradeapi/v1)
-
-set(PROTO_SRCS "")
-set(PROTO_HDRS "")
+set(PROTO_SRCS ${DATE_PB_CC})
+set(PROTO_HDRS ${DATE_PB_H})
 
 foreach(PROTO_FILE ${PROTO_FILES})
     get_filename_component(PROTO_NAME ${PROTO_FILE} NAME_WE)
@@ -58,26 +74,16 @@ foreach(PROTO_FILE ${PROTO_FILES})
     list(APPEND PROTO_SRCS ${PB_CC} ${GRPC_CC})
     list(APPEND PROTO_HDRS ${PB_H}  ${GRPC_H})
 
-    set(PROTOC_ARGS
-        --proto_path=${FINAM_PROTO_ROOT}
-        --cpp_out=${PROTO_GEN_DIR}
-        --grpc_out=${PROTO_GEN_DIR}
-        --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
-    )
-    if(PROTOBUF_INCLUDE_DIR)
-        list(APPEND PROTOC_ARGS --proto_path=${PROTOBUF_INCLUDE_DIR})
-    endif()
-    list(APPEND PROTOC_ARGS ${PROTO_FILE})
-
     add_custom_command(
         OUTPUT  ${PB_CC} ${PB_H} ${GRPC_CC} ${GRPC_H}
-        COMMAND ${PROTOC_EXECUTABLE} ${PROTOC_ARGS}
-        DEPENDS ${PROTO_FILE}
+        COMMAND ${PROTOC_EXECUTABLE} ${PROTOC_BASE_ARGS} ${PROTO_FILE}
+        DEPENDS ${PROTO_FILE} ${DATE_PB_H}
         COMMENT "Generating protobuf/gRPC for ${PROTO_NAME}.proto"
         VERBATIM
     )
 endforeach()
 
+# ── Библиотека ───────────────────────────────────────────────────────────────
 add_library(finam_proto STATIC ${PROTO_SRCS} ${PROTO_HDRS})
 
 target_include_directories(finam_proto PUBLIC
@@ -88,4 +94,4 @@ target_link_libraries(finam_proto PUBLIC
     gRPC::grpc++
     protobuf::libprotobuf
 )
-# Сгенерированный protobuf-код — без строгих warning-флагов проекта
+# Сгенерированный код — без строгих warning-флагов проекта
