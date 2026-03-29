@@ -5,6 +5,7 @@ spdlog/1.12.0
 nlohmann_json/3.11.3
 abseil/20230125.3
 gtest/1.14.0
+googleapis/cci.20230501
 
 [generators]
 CMakeDeps
