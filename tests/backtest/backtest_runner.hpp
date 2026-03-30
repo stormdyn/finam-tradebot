@@ -9,7 +9,7 @@
 #include <vector>
 #include <spdlog/spdlog.h>
 
-#include "core/interfaces.hpp"   // Bar, Signal
+#include "core/interfaces.hpp"
 #include "strategy/confluence_strategy.hpp"
 
 namespace finam::backtest {
@@ -23,7 +23,7 @@ struct Trade {
     std::string exit_date;
     double      entry_price {0.0};
     double      exit_price  {0.0};
-    int         direction   {0};   // +1 long, -1 short
+    int         direction   {0};    // +1 long, -1 short
     double      pnl_ticks   {0.0};
     ExitReason  reason      {ExitReason::ForceClose};
 };
@@ -33,7 +33,7 @@ struct BacktestResult {
     int    total_trades    {0};
     int    wins            {0};
     int    losses          {0};
-    double win_rate        {0.0};  // %
+    double win_rate        {0.0};
     double total_pnl_ticks {0.0};
     double max_win         {0.0};
     double max_loss        {0.0};
@@ -43,31 +43,33 @@ struct BacktestResult {
 
     void print() const {
         spdlog::info("");
-        spdlog::info("╔{:=<54}\u2557", "");
-        spdlog::info("║  {:<52}  ║", "BACKTEST RESULTS");
-        spdlog::info("╟{:-<54}\u2562", "");
-        spdlog::info("║  Bars processed : {:<33}  ║", total_bars);
-        spdlog::info("║  Total trades   : {:<33}  ║", total_trades);
-        spdlog::info("║  Wins / Losses  : {} / {:<27}  ║", wins, losses);
-        spdlog::info("║  Win rate       : {:<32.1f}%  ║", win_rate);
-        spdlog::info("║  Total PnL      : {:<30.0f} tk  ║", total_pnl_ticks);
-        spdlog::info("║  Max win        : {:<30.0f} tk  ║", max_win);
-        spdlog::info("║  Max loss       : {:<30.0f} tk  ║", max_loss);
-        spdlog::info("║  Max drawdown   : {:<30.0f} tk  ║", max_drawdown);
-        spdlog::info("║  Profit factor  : {:<33.2f}  ║", profit_factor);
-        spdlog::info("╚{:=<54}\u255d", "");
+        spdlog::info("╔{:=<52}\u2557", "");
+        spdlog::info("║  {:<50}  ║", "BACKTEST RESULTS");
+        spdlog::info("╟{:-<52}\u2562", "");
+        spdlog::info("║  Bars       : {:<36}  ║", total_bars);
+        spdlog::info("║  Trades     : {:<36}  ║", total_trades);
+        spdlog::info("║  Win/Loss   : {} / {:<31}  ║", wins, losses);
+        spdlog::info("║  Win rate   : {:<35.1f}%  ║", win_rate);
+        spdlog::info("║  Total PnL  : {:<33.0f} tk  ║", total_pnl_ticks);
+        spdlog::info("║  Max win    : {:<33.0f} tk  ║", max_win);
+        spdlog::info("║  Max loss   : {:<33.0f} tk  ║", max_loss);
+        spdlog::info("║  Drawdown   : {:<33.0f} tk  ║", max_drawdown);
+        spdlog::info("║  P.Factor   : {:<36.2f}  ║", profit_factor);
+        spdlog::info("╚{:=<52}\u255d", "");
     }
 
     void to_csv(const std::string& path) const {
         std::ofstream f{path};
         if (!f) { spdlog::error("[BT] cannot write {}", path); return; }
-        f << "entry_date,exit_date,direction,entry_price,exit_price,"
-             "pnl_ticks,reason\n";
+        f << "entry_date,exit_date,direction,entry_price,"
+             "exit_price,pnl_ticks,reason\n";
         for (const auto& t : trades) {
-            f << t.entry_date << ',' << t.exit_date << ','
+            f << t.entry_date  << ','
+              << t.exit_date   << ','
               << (t.direction > 0 ? "LONG" : "SHORT") << ','
-              << t.entry_price << ',' << t.exit_price << ','
-              << t.pnl_ticks << ','
+              << t.entry_price << ','
+              << t.exit_price  << ','
+              << t.pnl_ticks   << ','
               << (t.reason == ExitReason::TakeProfit ? "TP" :
                   t.reason == ExitReason::StopLoss   ? "SL" : "FC")
               << '\n';
@@ -76,37 +78,27 @@ struct BacktestResult {
     }
 };
 
-// ── load_csv ──────────────────────────────────────────────────────────────────────────
-//
-// Читает CSV: date,open,high,low,close,volume
-// Попускает заголовок и пустые строки.
+// ── load_csv ───────────────────────────────────────────────────────────────────────
 
 [[nodiscard]] inline std::vector<Bar> load_csv(const std::string& path) {
     std::ifstream f{path};
-    if (!f) {
-        spdlog::error("[BT] cannot open {}", path);
-        return {};
-    }
+    if (!f) { spdlog::error("[BT] cannot open {}", path); return {}; }
     std::vector<Bar> bars;
     std::string line;
-    std::getline(f, line);  // заголовок
+    std::getline(f, line);   // header
     while (std::getline(f, line)) {
         if (line.empty()) continue;
         std::istringstream ss{line};
         std::string date, o, h, l, c, v;
-        if (!std::getline(ss, date, ',') ||
-            !std::getline(ss, o, ',')    ||
-            !std::getline(ss, h, ',')    ||
-            !std::getline(ss, l, ',')    ||
-            !std::getline(ss, c, ',')    ||
-            !std::getline(ss, v, ',')) continue;
+        if (!std::getline(ss,date,',') || !std::getline(ss,o,',') ||
+            !std::getline(ss,h,',')   || !std::getline(ss,l,',') ||
+            !std::getline(ss,c,',')   || !std::getline(ss,v,',')) continue;
         try {
             bars.push_back(Bar{
-                .date   = date,
-                .open   = std::stod(o),
-                .high   = std::stod(h),
-                .low    = std::stod(l),
-                .close  = std::stod(c),
+                .date      = date,
+                .timeframe = "D1",
+                .open  = std::stod(o), .high  = std::stod(h),
+                .low   = std::stod(l), .close = std::stod(c),
                 .volume = static_cast<int64_t>(std::stoll(v)),
             });
         } catch (...) { continue; }
@@ -117,23 +109,30 @@ struct BacktestResult {
 
 // ── BacktestRunner ──────────────────────────────────────────────────────────────────
 //
-// runner{strategy, config}  →  result = runner.run(bars)
+// runner(strategy, config)  →  result = runner.run(bars)
 //
-// Модель: вход по bar.close, SL/TP по high/low текущего бара (худший случай).
-// Трейдофф: D1 — оптимистичнее реальности (внутрибаровый путь не моделируется).
-// Комиссия вычитается в тиках с каждой сделки.
+// Подаём каждый D1-бар через strategy.on_bar().
+// SL/TP оцениваем по high/low за тот же бар (худший случай).
+// on_quote() не вызываем — D1 бэктест работает только через on_bar() + SL/TP по OHLC.
+//
+// Трейдофф: без внутрибарового пути — equity curve оптимистичнее реальности.
+// Для точного моделирования нужны M1-данные.
 
 class BacktestRunner {
 public:
     struct Config {
-        double tick_size  {1.0};
-        double slippage   {0.0};  // тиков на вход/выход
-        double commission {0.0};  // тиков на сделку (round-trip / 2)
+        double sl_ticks  {30.0};
+        double tp_ticks  {90.0};
+        double tick_size {1.0};
+        double slippage  {0.0};  // тиков на вход/выход
+        double commission{0.0};  // тиков раунд-трип
     };
 
+    // Конфиг sl/tp берём из переданного Config (не из ConfluenceStrategy.cfg),
+    // чтобы можно было свипать параметрами из CLI без пересборки стратегии.
     BacktestRunner(
         strategy::ConfluenceStrategy& strategy,
-        Config                        cfg = {})
+        Config                        cfg)
         : strategy_(strategy)
         , cfg_(cfg)
     {}
@@ -142,7 +141,7 @@ public:
 
 private:
     void check_exit(const Bar&, BacktestResult&);
-    void open_position(const Signal&, const Bar&, BacktestResult&);
+    void open_position(const Bar&, Signal::Direction, BacktestResult&);
     void close_position(double price, const Bar&, ExitReason, BacktestResult&);
     void force_close(const Bar&, BacktestResult&);
     void finalize(BacktestResult&) const;
