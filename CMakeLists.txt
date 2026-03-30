@@ -23,4 +23,5 @@ target_compile_options(project_warnings INTERFACE
 
 add_subdirectory(proto)
 add_subdirectory(src)
+add_subdirectory(src/connectivity_check)
 add_subdirectory(tests)

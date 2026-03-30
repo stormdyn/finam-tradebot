@@ -7,6 +7,7 @@
 #include <spdlog/spdlog.h>
 #include "auth/token_manager.hpp"
 #include "risk/risk_manager.hpp"
+#include "core/contract.hpp"
 
 #include "confluence_strategy.hpp"
 #include "core/spsc_queue.hpp"
@@ -15,22 +16,25 @@
 
 namespace finam::strategy {
 
-// ── StrategyRunner ───────────────────────────────────────────────────────────────────
+// ── StrategyRunner ───────────────────────────────────────────────────────────
 //
 // Threading model:
-//   gRPC MD threads      →  queue_.push()         →  strategy_thread_ (consumer)
-//   OrderClient stream   →  queue_.push(OrderUpdate) →  strategy_thread_
-//   strategy_thread_     →  risk_->check()        →  executor_->submit()
+//   gRPC MD threads  →  queue_.push()            →  strategy_thread_
+//   OrderClient      →  queue_.push(OrderUpdate)  →  strategy_thread_
+//   rollover_thread_ →  queue_.push(RolloverEvent) →  strategy_thread_
 //
-// Почему OrderUpdate через очередь, а не напрямую в on_order_update:
-// — избегаем data race с position_ в ConfluenceStrategy (Strategy не thread-safe).
-// — порядок событий сохраняется (FIFO в очереди).
+// Роллирование:
+//   Отдельный поток каждую минуту вызывает nearest_contract().
+//   Если символ изменился — пушим RolloverEvent в ту же SPSC-очередь.
+//   strategy_thread_ получает событие, отписывается, сбрасывает стратегию,
+//   переподписывается — всё строго из одного потока, нет data-race.
 
 class StrategyRunner {
 public:
     struct Config {
         ConfluenceStrategy::Config strategy;
         int  history_days{20};
+        int  rollover_days{5};  // передаётся в nearest_contract()
         std::chrono::microseconds poll_interval{100};
     };
 
@@ -41,6 +45,7 @@ public:
         std::shared_ptr<auth::TokenManager>            token_mgr,
         std::shared_ptr<risk::RiskManager>             risk = nullptr)
         : strategy_(cfg.strategy)
+        , cfg_(cfg)
         , md_(std::move(md))
         , executor_(std::move(executor))
         , token_mgr_(std::move(token_mgr))
@@ -49,26 +54,21 @@ public:
     {
         load_history(cfg);
         start_strategy_thread();
-        start_subscriptions();
+        start_subscriptions(strategy_.symbol());
+        start_rollover_watchdog();
     }
 
     ~StrategyRunner() {
         stop_.store(true, std::memory_order_release);
-        if (strategy_thread_.joinable())
-            strategy_thread_.join();
+        if (rollover_thread_.joinable()) rollover_thread_.join();
+        if (strategy_thread_.joinable()) strategy_thread_.join();
     }
 
     StrategyRunner(const StrategyRunner&)            = delete;
     StrategyRunner& operator=(const StrategyRunner&) = delete;
 
-    // ── Public API ──────────────────────────────────────────────────────────────────
-
-    // Возвращает callback для OrderClient::set_update_callback().
-    // Коллбэк вызывается из order stream thread — пушим в SPSC-очередь,
-    // не заходим прямо в strategy (Single Producer — order thread).
     [[nodiscard]] finam::order::OrderUpdateCallback make_order_callback() {
         return [this](const OrderUpdate& upd) {
-            // risk on_fill — thread-safe через atomic/mutex внутри RiskManager
             if (risk_ &&
                 (upd.status == OrderStatus::Filled ||
                  upd.status == OrderStatus::PartialFill) &&
@@ -76,20 +76,50 @@ public:
             {
                 risk_->on_fill(upd);
             }
-            // strategy.on_order_update — не thread-safe, пушим через очередь
             if (!queue_.push(upd))
                 spdlog::warn("[Runner] order_queue full, OrderUpdate dropped");
         };
     }
 
 private:
-    // OrderUpdate добавлен в вариант для SPSC-очереди
-    using MdEvent = std::variant<BookLevelEvent, TradeEvent, Quote, OrderUpdate>;
+    // ── RolloverEvent ────────────────────────────────────────────────────────────
+    struct RolloverEvent { Symbol new_symbol; };
+
+    using MdEvent = std::variant<
+        BookLevelEvent, TradeEvent, Quote, OrderUpdate, RolloverEvent>;
 
     static constexpr std::size_t kQueueSize = 1024;
     using Queue = core::SpscQueue<MdEvent, kQueueSize>;
 
-    // ── Strategy thread ───────────────────────────────────────────────────────────────
+    // ── Rollover watchdog ─────────────────────────────────────────────────────────
+
+    void start_rollover_watchdog() {
+        rollover_thread_ = std::thread([this] {
+            spdlog::debug("[Runner] rollover watchdog started");
+            while (!stop_.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::minutes{1});
+                if (stop_.load(std::memory_order_acquire)) break;
+                check_rollover();
+            }
+        });
+    }
+
+    void check_rollover() {
+        const auto next = core::nearest_contract(
+            base_ticker_, cfg_.rollover_days);
+        // active_symbol_ читается только из rollover_thread_, пишется из strategy_thread_
+        // → используем atomic<Symbol> через string-атом (copy under mutex)
+        const Symbol cur = active_symbol();
+        if (next.security_code == cur.security_code) return;
+
+        spdlog::info("[Runner] rollover detected: {} → {}",
+            cur.to_string(), next.to_string());
+
+        if (!queue_.push(RolloverEvent{next}))
+            spdlog::error("[Runner] queue full, rollover event dropped!");
+    }
+
+    // ── Strategy thread ────────────────────────────────────────────────────────────
 
     void start_strategy_thread() {
         strategy_thread_ = std::thread([this] {
@@ -98,7 +128,7 @@ private:
                 drain_queue();
                 std::this_thread::sleep_for(poll_interval_);
             }
-            drain_queue();  // финальный дрейн
+            drain_queue();
             spdlog::info("[Runner] strategy thread stopped");
         });
     }
@@ -111,55 +141,74 @@ private:
     void dispatch(const BookLevelEvent& e) noexcept {
         if (auto sig = strategy_.on_book_event(e)) handle_signal(*sig);
     }
-
     void dispatch(const TradeEvent& e) noexcept {
         if (auto sig = strategy_.on_trade_event(e)) handle_signal(*sig);
     }
-
     void dispatch(const Quote& q) noexcept {
         strategy_.update_bbo(q.bid, q.ask);
         const auto sig = strategy_.on_quote(q);
         if (sig.direction != Signal::Direction::None) handle_signal(sig);
     }
-
-    // Отдельный dispatch для OrderUpdate — вызываем strategy в strategy thread
     void dispatch(const OrderUpdate& upd) noexcept {
         strategy_.on_order_update(upd);
     }
 
+    // ── Rollover handler (strategy thread) ───────────────────────────────────────
+
+    void dispatch(const RolloverEvent& ev) noexcept {
+        spdlog::info("[Runner] executing rollover to {}", ev.new_symbol.to_string());
+
+        // 1. Отписываемся от старого символа
+        unsubscribe_all();
+
+        // 2. Сбрасываем стратегию (позиция уже закрыта check_expiry в RiskManager)
+        strategy_.on_session_open();
+
+        // 3. Обновляем active symbol
+        set_active_symbol(ev.new_symbol);
+
+        // 4. Загружаем историю по новому контракту
+        Config cfg_copy = cfg_;
+        cfg_copy.strategy.symbol = ev.new_symbol;
+        load_history(cfg_copy);
+
+        // 5. Подписываемся на новый символ
+        start_subscriptions(ev.new_symbol);
+        spdlog::info("[Runner] rollover complete, active={}",
+            ev.new_symbol.to_string());
+    }
+
     // ── Subscriptions ────────────────────────────────────────────────────────────────
 
-    void start_subscriptions() {
-        const auto& sym = strategy_.symbol();
-
+    void start_subscriptions(const Symbol& sym) {
         book_sub_ = md_->subscribe_book_events(sym,
             [this](const BookLevelEvent& e) {
                 if (!queue_.push(e))
-                    spdlog::warn("[Runner] book_queue full, event dropped");
+                    spdlog::warn("[Runner] book_queue full");
             });
-
         trade_sub_ = md_->subscribe_latest_trades(sym,
             [this](const TradeEvent& e) {
                 if (!queue_.push(e))
-                    spdlog::warn("[Runner] trade_queue full, event dropped");
+                    spdlog::warn("[Runner] trade_queue full");
             });
-
         quote_sub_ = md_->subscribe_quotes({sym},
             [this](const Quote& q) {
                 if (!queue_.push(q))
-                    spdlog::warn("[Runner] quote_queue full, event dropped");
+                    spdlog::warn("[Runner] quote_queue full");
             });
-
-        // M1 бары — редкие, не через queue (нет contention с MD-потокам)
         m1_bar_sub_ = md_->subscribe_bars(sym, "M1",
             [this](const Bar& bar) { strategy_.on_bar(bar); });
-
-        // D1 бары live — нужны для обновления ATR/NR7 в реальном времени
-        // Примечание: D1-бар закрывается раз в сутки, поэтому также не через queue
         d1_bar_sub_ = md_->subscribe_bars(sym, "D1",
             [this](const Bar& bar) { strategy_.on_bar(bar); });
+        spdlog::info("[Runner] subscribed to {}", sym.to_string());
+    }
 
-        spdlog::info("[Runner] subscriptions started (book/trade/quote/M1/D1)");
+    void unsubscribe_all() noexcept {
+        book_sub_   = {};
+        trade_sub_  = {};
+        quote_sub_  = {};
+        m1_bar_sub_ = {};
+        d1_bar_sub_ = {};
     }
 
     // ── History ──────────────────────────────────────────────────────────────────────
@@ -174,14 +223,14 @@ private:
             return;
         }
         for (const auto& bar : *result) strategy_.on_bar(bar);
-        spdlog::info("[Runner] loaded {} D1 bars", result->size());
+        spdlog::info("[Runner] loaded {} D1 bars for {}",
+            result->size(), cfg.strategy.symbol.to_string());
     }
 
-    // ── Signal execution (только из strategy_thread_) ──────────────────────────────────
+    // ── Signal execution ───────────────────────────────────────────────────────────
 
     void handle_signal(const Signal& sig) {
         if (sig.direction == Signal::Direction::None) return;
-
         const bool is_close = (sig.direction == Signal::Direction::Close);
         OrderRequest req{
             .client_id = std::string(token_mgr_->primary_account_id()),
@@ -192,8 +241,6 @@ private:
             .price     = sig.price,
             .quantity  = sig.quantity,
         };
-
-        // Close-сигналы проходят без risk-проверки
         if (risk_ && !is_close) {
             if (auto r = risk_->check(req); !r) {
                 spdlog::warn("[Runner] risk REJECTED {}: {}",
@@ -204,36 +251,53 @@ private:
                 return;
             }
         }
-
         spdlog::info("[Runner] signal {} {} qty={}",
             sig.symbol.to_string(),
-            sig.direction == Signal::Direction::Buy   ? "BUY"  :
-            sig.direction == Signal::Direction::Sell  ? "SELL" :
-            sig.direction == Signal::Direction::Close ? "CLOSE": "?",
+            is_close ? "CLOSE" :
+            sig.direction == Signal::Direction::Buy ? "BUY" : "SELL",
             sig.quantity);
-
         if (auto result = executor_->submit(req); !result)
             spdlog::error("[Runner] order rejected: {}", result.error().message);
+    }
+
+    // ── Active symbol (shared between rollover_thread_ and strategy_thread_) ──────
+    // rollover_thread_ читает active_symbol_str_, strategy_thread_ пишет —
+    // защищаем мютексом. Не hot-path — вызывается раз в минуту.
+    [[nodiscard]] Symbol active_symbol() const {
+        std::lock_guard lock(sym_mu_);
+        return active_symbol_;
+    }
+    void set_active_symbol(const Symbol& s) {
+        std::lock_guard lock(sym_mu_);
+        active_symbol_ = s;
     }
 
     // ── Members ──────────────────────────────────────────────────────────────────────
 
     ConfluenceStrategy                              strategy_;
+    Config                                          cfg_;
     std::shared_ptr<market_data::MarketDataClient>  md_;
     std::shared_ptr<IOrderExecutor>                 executor_;
     std::shared_ptr<auth::TokenManager>             token_mgr_;
     std::shared_ptr<risk::RiskManager>              risk_;
 
-    Queue                        queue_;
-    std::thread                  strategy_thread_;
-    std::atomic<bool>            stop_{false};
-    std::chrono::microseconds    poll_interval_;
+    Queue                     queue_;
+    std::thread               strategy_thread_;
+    std::thread               rollover_thread_;
+    std::atomic<bool>         stop_{false};
+    std::chrono::microseconds poll_interval_;
+
+    // base ticker (без серии) — для nearest_contract()
+    std::string_view          base_ticker_{"Si"};
+
+    mutable std::mutex        sym_mu_;
+    Symbol                    active_symbol_{strategy_.symbol()};
 
     market_data::SubscriptionHandle  book_sub_;
     market_data::SubscriptionHandle  trade_sub_;
     market_data::SubscriptionHandle  quote_sub_;
     market_data::SubscriptionHandle  m1_bar_sub_;
-    market_data::SubscriptionHandle  d1_bar_sub_;  // live D1 для обновления ATR
+    market_data::SubscriptionHandle  d1_bar_sub_;
 };
 
 } // namespace finam::strategy
