@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    name: Build & Lint (ubuntu-24.04)
+    name: Build, Unit Tests & Lint (ubuntu-24.04)
     runs-on: ubuntu-24.04
 
     steps:
@@ -17,7 +17,6 @@ jobs:
         with:
           submodules: recursive
 
-      # ── Системные зависимости ──────────────────────────────────────────────────
       - name: Install system deps
         run: |
           sudo apt-get update
@@ -27,7 +26,6 @@ jobs:
             protobuf-compiler protobuf-compiler-grpc \
             clang-tidy python3-pip
 
-      # ── Conan ──────────────────────────────────────────────────────────────────
       - name: Install Conan
         run: pip3 install --break-system-packages 'conan==2.*'
 
@@ -49,7 +47,6 @@ jobs:
             -s compiler.cppstd=23 \
             -s build_type=Release
 
-      # ── CMake configure ────────────────────────────────────────────────────────────
       - name: CMake configure
         run: |
           cmake -S . -B build \
@@ -59,12 +56,14 @@ jobs:
             -DCMAKE_CXX_STANDARD=23 \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-      # ── Build ─────────────────────────────────────────────────────────────────────
       - name: Build
         run: cmake --build build --parallel $(nproc)
 
-      # ── clang-tidy ─────────────────────────────────────────────────────────────────
-      # Проверяем только src/ (не вендор, не proto)
+      # ── Unit tests ────────────────────────────────────────────────────────────
+      - name: Run unit tests (CTest)
+        run: ctest --test-dir build --output-on-failure -j$(nproc)
+
+      # ── clang-tidy ────────────────────────────────────────────────────────────
       - name: clang-tidy
         run: |
           find src -name '*.cpp' | xargs clang-tidy \
@@ -72,7 +71,6 @@ jobs:
             --config-file=.clangd \
             --warnings-as-errors='' \
             2>&1 | tee clang-tidy.log
-          # Не прерываем CI по предупреждениям — только по ошибкам
           if grep -q 'error:' clang-tidy.log; then exit 1; fi
         continue-on-error: false
 
@@ -87,7 +85,7 @@ jobs:
   docker:
     name: Docker build
     runs-on: ubuntu-24.04
-    needs: build  # запускаем только если build прошёл
+    needs: build
 
     steps:
       - name: Checkout
@@ -98,7 +96,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Кэшируем Docker слои по Dockerfile + lock-файлу
       - name: Cache Docker layers
         uses: actions/cache@v4
         with:
@@ -115,7 +112,6 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
 
-      # Предотвращаем неограниченный рост кэша
       - name: Rotate Docker cache
         run: |
           rm -rf /tmp/.buildx-cache

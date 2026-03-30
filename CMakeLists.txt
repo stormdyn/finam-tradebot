@@ -5,19 +5,16 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Conan toolchain подключается через -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake
 list(APPEND CMAKE_PREFIX_PATH "${CMAKE_BINARY_DIR}")
 
-# ── Зависимости ───────────────────────────────────────────────────────────────
-find_package(gRPC          REQUIRED)   # системный /usr
-find_package(Protobuf      REQUIRED)   # системный /usr
-find_package(spdlog        REQUIRED)   # Conan
-find_package(nlohmann_json REQUIRED)   # Conan
+# ── Зависимости ───────────────────────────────────────────────────────────────────
+find_package(gRPC          REQUIRED)
+find_package(Protobuf      REQUIRED)
+find_package(spdlog        REQUIRED)
+find_package(nlohmann_json REQUIRED)
+find_package(Catch2        REQUIRED)
 
-# spdlog использует свой bundled fmt — НЕ устанавливаем SPDLOG_FMT_EXTERNAL,
-# чтобы избежать конфликта с системным /usr/include/fmt (v12 на Arch)
-
-# ── Warnings target ───────────────────────────────────────────────────────────
+# ── Warnings target ──────────────────────────────────────────────────────────────
 add_library(project_warnings INTERFACE)
 target_compile_options(project_warnings INTERFACE
     -Wall -Wextra -Wpedantic -Wshadow
@@ -26,3 +23,4 @@ target_compile_options(project_warnings INTERFACE
 
 add_subdirectory(proto)
 add_subdirectory(src)
+add_subdirectory(tests)
