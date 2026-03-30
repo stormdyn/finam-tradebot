@@ -180,15 +180,11 @@ std::optional<OrderState> OrderClient::find(int32_t local_id) const {
 }
 
 // ── upsert ─────────────────────────────────────────────────────────────────────────
-//
-// Вызывается как из submit(), так и из run_order_stream().
-// on_update_ — подписчик (StrategyRunner), который передаёт обновления
-// стратегии и RiskManager::on_fill().
 
 void OrderClient::upsert(OrderState state) {
     const int32_t lid = state.local_id;
 
-    // Перед записью в кэш получаем предыдущее состояние для delta qty_filled
+    // Дельта qty_filled для правильного on_fill в RiskManager
     int32_t prev_filled = 0;
     {
         std::shared_lock rlock(orders_mu_);
@@ -207,7 +203,7 @@ void OrderClient::upsert(OrderState state) {
         .type           = state.type,
         .price          = state.price,
         .qty_total      = state.qty_total,
-        .qty_filled     = delta_filled,   // дельта — сколько было исполнено в этот раз
+        .qty_filled     = delta_filled,
         .message        = state.reject_reason,
         .ts             = state.ts,
     };
@@ -217,16 +213,12 @@ void OrderClient::upsert(OrderState state) {
         orders_[lid] = std::move(state);
     }
 
-    // on_update_ вызывается после разблокировки мьютекса, чтобы
-    // избежать deadlock если callback сам обращается к cancel()
-    if (on_update_) on_update_(upd);
+    // invoke_callback блокирует cb_mu_ — вызываем после orders_mu_,
+    // чтобы избежать deadlock если callback обращается к cancel()
+    invoke_callback(upd);
 }
 
 // ── run_order_stream ──────────────────────────────────────────────────────────────
-//
-// Цикл: техобслуживание → connect → drain → backoff → повтор
-// Backoff: та же ExponentialBackoff что и в MD-стримах.
-// Окно техобслуживания: 05:00-06:15 MSK (ожидаем, не реконнектимся).
 
 void OrderClient::run_order_stream() {
     spdlog::info("[Order] order stream started account={}", account_id_);
@@ -234,7 +226,6 @@ void OrderClient::run_order_stream() {
     core::MaintenanceWindow   maint;
 
     while (!stop_.load(std::memory_order_acquire)) {
-        // Ожидаем окно ТО — не пытаемся подключиться пока биржа закрыта
         if (!maint.wait_if_active(stop_)) break;
 
         auto ctx = make_context();
@@ -245,20 +236,13 @@ void OrderClient::run_order_stream() {
         proto_orders::SubscribeOrdersResponse resp;
         while (!stop_.load(std::memory_order_acquire) && stream->Read(&resp)) {
             for (const auto& o : resp.orders()) {
-                int32_t local_id = 0;
-                try { local_id = std::stoi(o.order().client_order_id()); }
-                catch (...) {}
-
+                int32_t local_id  = 0;
                 int32_t qty_total = 0;
                 int32_t filled    = 0;
-                try {
-                    qty_total = static_cast<int32_t>(
-                        std::stod(o.initial_quantity().value()));
-                    filled = static_cast<int32_t>(
-                        std::stod(o.executed_quantity().value()));
-                } catch (...) {}
+                try { local_id  = std::stoi(o.order().client_order_id()); } catch (...) {}
+                try { qty_total = static_cast<int32_t>(std::stod(o.initial_quantity().value())); } catch (...) {}
+                try { filled    = static_cast<int32_t>(std::stod(o.executed_quantity().value())); } catch (...) {}
 
-                // Достраиваем symbol: если ордер есть в кэше — берём символ оттуда
                 Symbol sym;
                 {
                     std::shared_lock rlock(orders_mu_);
@@ -282,13 +266,11 @@ void OrderClient::run_order_stream() {
                     .ts            = std::chrono::system_clock::now(),
                 });
             }
-            bo.reset();  // успешное чтение — сбрасываем backoff
+            bo.reset();
         }
         stream->Finish();
 
         if (stop_.load(std::memory_order_acquire)) break;
-
-        // Техобслуживание — не backoff, просто ждём
         if (maint.is_active()) continue;
 
         spdlog::warn("[Order] stream ended, reconnect #{} with backoff", bo.attempt() + 1);
