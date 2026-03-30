@@ -1,0 +1,54 @@
+# ── docker-compose.yml ───────────────────────────────────────────────────────────────────
+#
+# Использование:
+#   FINAM_SECRET_TOKEN=<token> docker compose up -d
+#
+# Для dry-run:
+#   FINAM_SECRET_TOKEN=<token> docker compose run --rm tradebot --dry-run
+#
+# Логи (ротация spdlog внутри контейнера):
+#   docker compose logs -f tradebot
+#
+# Мониторинг:
+#   curl http://localhost:8080/health
+#   curl http://localhost:8080/metrics
+# ─────────────────────────────────────────────────────────────────────────
+
+services:
+  tradebot:
+    image: finam-tradebot:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+
+    environment:
+      # Токен передаётся через host env, не запекаясь в образ
+      FINAM_SECRET_TOKEN: "${FINAM_SECRET_TOKEN}"
+
+    ports:
+      - "8080:8080"   # health + metrics
+
+    volumes:
+      - logs:/app/logs   # файлы логов на host
+
+    healthcheck:
+      test: ["CMD", "sh", "-c",
+             "wget -qO- http://localhost:8080/health | grep -q ok"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+    # Ограничение ресурсов (least privilege)
+    mem_limit: 256m
+    cpus: "0.5"
+
+    # Безопасность: нет дополнительных привилегий
+    security_opt:
+      - no-new-privileges:true
+    read_only: false   # logs/ должен быть записываемым
+
+volumes:
+  logs:
+    driver: local
