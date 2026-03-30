@@ -1,5 +1,6 @@
 #include "token_manager.hpp"
 #include <stdexcept>
+#include "core/grpc_fmt.hpp"  // перед spdlog
 #include <spdlog/spdlog.h>
 #include "grpc/tradeapi/v1/auth/auth_service.grpc.pb.h"
 
