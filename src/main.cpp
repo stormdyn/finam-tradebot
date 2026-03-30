@@ -1,18 +1,34 @@
+#include <csignal>
 #include <cstdlib>
+#include <atomic>
 #include <thread>
 #include <spdlog/spdlog.h>
+
 #include "auth/token_manager.hpp"
 #include "market_data/market_data_client.hpp"
 #include "order/order_client.hpp"
+#include "strategy/strategy_runner.hpp"
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+static std::atomic<bool> g_shutdown{false};
+
+static void signal_handler(int) noexcept {
+    g_shutdown.store(true, std::memory_order_release);
+}
 
 int main() {
     spdlog::set_level(spdlog::level::debug);
-    spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] %v");
+    spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] [%t] %v");
     spdlog::info("finam-tradebot starting");
 
+    // ── Signals ───────────────────────────────────────────────────────────────
+    std::signal(SIGINT,  signal_handler);
+    std::signal(SIGTERM, signal_handler);
+
+    // ── Env ───────────────────────────────────────────────────────────────────
     const char* secret = std::getenv("FINAM_SECRET_TOKEN");
     if (!secret) {
-        spdlog::critical("FINAM_SECRET_TOKEN env variable not set");
+        spdlog::critical("FINAM_SECRET_TOKEN not set");
         return 1;
     }
 
@@ -27,59 +43,58 @@ int main() {
         spdlog::critical("Auth failed: {}", r.error().message);
         return 1;
     }
-    spdlog::info("Primary account: {}", token_mgr->primary_account_id());
+    spdlog::info("Authenticated, account: {}", token_mgr->primary_account_id());
 
-    const std::string account_id{token_mgr->primary_account_id()};
-
-    // ── MarketData ────────────────────────────────────────────────────────────
+    // ── Market data ───────────────────────────────────────────────────────────
     auto md = std::make_shared<finam::market_data::MarketDataClient>(token_mgr);
 
-    auto quotes_sub = md->subscribe_quotes(
-        { finam::Symbol{"Si-6.26", "FORTS"} },
-        [](const finam::Quote& q) {
-            spdlog::debug("[quote] {} bid={} ask={} last={}",
-                q.symbol.to_string(), q.bid, q.ask, q.last);
-        }
-    );
+    // ── Order executor ────────────────────────────────────────────────────────
+    const std::string account_id{token_mgr->primary_account_id()};
 
-    // ── Orders ────────────────────────────────────────────────────────────────
     auto order_client = std::make_shared<finam::order::OrderClient>(
         token_mgr,
         account_id,
         [](const finam::OrderUpdate& upd) {
-            spdlog::info("[order_update] local_id={} symbol={} status={}",
+            spdlog::info("[order] id={} symbol={} status={} filled={}",
                 upd.transaction_id,
                 upd.symbol.to_string(),
-                static_cast<int>(upd.status));
+                static_cast<int>(upd.status),
+                upd.qty_filled);
         }
     );
 
-    // Тест: submit лимитной заявки
-    auto result = order_client->submit(finam::OrderRequest{
-        .client_id = account_id,
-        .symbol    = {"Si-6.26", "FORTS"},
-        .side      = finam::OrderSide::Buy,
-        .type      = finam::OrderType::Limit,
-        .price     = 85000.0,
-        .quantity  = 1,
-    });
+    // ── Strategy ──────────────────────────────────────────────────────────────
+    finam::strategy::StrategyRunner::Config runner_cfg{
+        .strategy = finam::strategy::ConfluenceStrategy::Config{
+            .symbol    = finam::Symbol{"Si-6.26", "FORTS"},
+            .base_qty  = 1,
+            .sl_ticks  = 30.0,
+            .tp_ticks  = 90.0,
+            .tick_size = 1.0,
+            // ob_cfg, tfi_cfg, spoof_cfg, session_cfg — defaults достаточно
+        },
+        .history_days  = 20,
+        .poll_interval = std::chrono::microseconds{100},
+    };
 
-    if (result)
-        spdlog::info("Order submitted, local_id={}", *result);
-    else
-        spdlog::error("Order failed: {}", result.error().message);
+    auto runner = std::make_unique<finam::strategy::StrategyRunner>(
+        runner_cfg,
+        md,
+        order_client,
+        token_mgr
+    );
 
-    // Проверяем трекер
-    auto active = order_client->active_orders();
-    spdlog::info("Active orders: {}", active.size());
+    spdlog::info("Strategy running, press Ctrl+C to stop");
 
-    // Тест: отмена
-    order_client->cancel(0, account_id);
-    spdlog::info("Active after cancel: {}", order_client->active_orders().size());
+    // ── Main loop ─────────────────────────────────────────────────────────────
+    while (!g_shutdown.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::seconds{1});
+    }
 
-    std::this_thread::sleep_for(std::chrono::seconds{1});
-
-    token_mgr->shutdown();
+    // ── Graceful shutdown ─────────────────────────────────────────────────────
+    spdlog::info("Shutting down...");
+    runner.reset();          // join strategy_thread, cancel subscriptions
+    token_mgr->shutdown();   // stop JWT renewal thread
     spdlog::info("finam-tradebot stopped");
     return 0;
 }
