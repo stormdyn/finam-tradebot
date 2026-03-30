@@ -5,24 +5,20 @@
 #include <chrono>
 #include <spdlog/spdlog.h>
 
-// После git submodule update --init --recursive
-// сгенерированные файлы окажутся в build/ (cmake генерирует их из proto)
 #include "grpc/tradeapi/v1/marketdata/marketdata_service.grpc.pb.h"
 #include "grpc/tradeapi/v1/marketdata/marketdata_service.pb.h"
 
 namespace finam::market_data {
 
-// ── Decimal helpers ───────────────────────────────────────────────────────────
+// ── Decimal helpers ───────────────────────────────────────────────────────────────────
 
 namespace {
 
-// google.type.Decimal — строковое представление числа ("85000.5")
 double decimal_to_double(const google::type::Decimal& d) noexcept {
     try { return std::stod(d.value()); }
     catch (...) { return 0.0; }
 }
 
-// Конвертация строки таймфрейма → proto enum
 ::grpc::tradeapi::v1::marketdata::TimeFrame timeframe_to_proto(
     std::string_view tf) noexcept
 {
@@ -48,7 +44,6 @@ std::chrono::system_clock::time_point ts_from_proto(
 }
 
 Symbol symbol_from_string(const std::string& s) {
-    // Формат: "Si-6.26@FORTS" → security_code="Si-6.26", security_board="FORTS"
     const auto at = s.rfind('@');
     if (at == std::string::npos) return Symbol{s, ""};
     return Symbol{s.substr(0, at), s.substr(at + 1)};
@@ -56,7 +51,7 @@ Symbol symbol_from_string(const std::string& s) {
 
 } // namespace
 
-// ── MarketDataClient ──────────────────────────────────────────────────────────
+// ── MarketDataClient ───────────────────────────────────────────────────────────────────
 
 MarketDataClient::MarketDataClient(
     std::shared_ptr<auth::TokenManager> token_mgr)
@@ -77,7 +72,7 @@ std::unique_ptr<grpc::ClientContext> MarketDataClient::make_context() const {
     return ctx;
 }
 
-// ── get_bars ──────────────────────────────────────────────────────────────────
+// ── get_bars ────────────────────────────────────────────────────────────────────────
 
 Result<std::vector<Bar>> MarketDataClient::get_bars(
     const Symbol&    symbol,
@@ -107,25 +102,27 @@ Result<std::vector<Bar>> MarketDataClient::get_bars(
         return std::unexpected(Error{ErrorCode::RpcError, status.error_message()});
     }
 
+    const std::string tf_str{timeframe};  // сохраняем для простановки в Bar
     std::vector<Bar> bars;
     bars.reserve(resp.bars_size());
     for (const auto& b : resp.bars()) {
         bars.push_back(Bar{
-            .symbol = symbol,
-            .open   = decimal_to_double(b.open()),
-            .high   = decimal_to_double(b.high()),
-            .low    = decimal_to_double(b.low()),
-            .close  = decimal_to_double(b.close()),
-            .volume = static_cast<int64_t>(decimal_to_double(b.volume())),
-            .ts     = ts_from_proto(b.timestamp()),
+            .symbol    = symbol,
+            .timeframe = tf_str,   // ← фикс: "D1" или "M1"
+            .open      = decimal_to_double(b.open()),
+            .high      = decimal_to_double(b.high()),
+            .low       = decimal_to_double(b.low()),
+            .close     = decimal_to_double(b.close()),
+            .volume    = static_cast<int64_t>(decimal_to_double(b.volume())),
+            .ts        = ts_from_proto(b.timestamp()),
         });
     }
 
-    spdlog::info("[MD] get_bars got {} bars", bars.size());
+    spdlog::info("[MD] get_bars got {} bars ({})", bars.size(), tf_str);
     return bars;
 }
 
-// ── subscribe_quotes ──────────────────────────────────────────────────────────
+// ── subscribe_quotes ──────────────────────────────────────────────────────────────────
 
 SubscriptionHandle MarketDataClient::subscribe_quotes(
     std::vector<Symbol> symbols,
@@ -186,7 +183,7 @@ SubscriptionHandle MarketDataClient::subscribe_quotes(
     });
 }
 
-// ── subscribe_bars ────────────────────────────────────────────────────────────
+// ── subscribe_bars ───────────────────────────────────────────────────────────────────
 
 SubscriptionHandle MarketDataClient::subscribe_bars(
     const Symbol&    symbol,
@@ -197,12 +194,13 @@ SubscriptionHandle MarketDataClient::subscribe_bars(
 
     auto stop    = std::make_shared<std::atomic<bool>>(false);
     auto sym_str = symbol.to_string();
+    auto tf_str  = std::string{timeframe};  // копия для ламбды
     auto tf      = timeframe_to_proto(timeframe);
 
-    auto thread = std::thread([this, sym_str, tf,
+    auto thread = std::thread([this, sym_str, tf_str, tf,
                                callback = std::move(callback), stop]() mutable
     {
-        spdlog::info("[MD] subscribe_bars started symbol={}", sym_str);
+        spdlog::info("[MD] subscribe_bars started symbol={} tf={}", sym_str, tf_str);
 
         while (!stop->load(std::memory_order_acquire)) {
             auto ctx = make_context();
@@ -218,13 +216,14 @@ SubscriptionHandle MarketDataClient::subscribe_bars(
             while (!stop->load() && stream->Read(&resp)) {
                 for (const auto& b : resp.bars()) {
                     callback(Bar{
-                        .symbol = sym,
-                        .open   = decimal_to_double(b.open()),
-                        .high   = decimal_to_double(b.high()),
-                        .low    = decimal_to_double(b.low()),
-                        .close  = decimal_to_double(b.close()),
-                        .volume = static_cast<int64_t>(decimal_to_double(b.volume())),
-                        .ts     = ts_from_proto(b.timestamp()),
+                        .symbol    = sym,
+                        .timeframe = tf_str,   // ← фикс: "M1" или "D1"
+                        .open      = decimal_to_double(b.open()),
+                        .high      = decimal_to_double(b.high()),
+                        .low       = decimal_to_double(b.low()),
+                        .close     = decimal_to_double(b.close()),
+                        .volume    = static_cast<int64_t>(decimal_to_double(b.volume())),
+                        .ts        = ts_from_proto(b.timestamp()),
                     });
                 }
             }
@@ -245,19 +244,7 @@ SubscriptionHandle MarketDataClient::subscribe_bars(
     });
 }
 
-// ── subscribe_order_book ──────────────────────────────────────────────────────
-//
-// SubscribeOrderBookResponse содержит repeated StreamOrderBook.
-// Каждый StreamOrderBook::Row несёт Action (ADD/UPDATE/REMOVE) и oneof side
-// (buy_size / sell_size) — это инкрементальный стрим, не снапшоты.
-//
-// protobuf генерирует enum-значения с полным flat-префиксом:
-//   StreamOrderBook_Row_Action_ACTION_REMOVE  (числовое значение = 1)
-//   StreamOrderBook_Row_Action_ACTION_ADD     (= 2)
-//   StreamOrderBook_Row_Action_ACTION_UPDATE  (= 3)
-// using-алиас Action = StreamOrderBook::Row::Action даёт доступ через
-// Action::ACTION_REMOVE — но ТОЛЬКО если компилятор поддерживает это.
-// Для надёжности используем числовой cast через static_cast<int>.
+// ── subscribe_order_book ───────────────────────────────────────────────────────────────
 
 SubscriptionHandle MarketDataClient::subscribe_order_book(
     const Symbol&     symbol,
@@ -288,8 +275,6 @@ SubscriptionHandle MarketDataClient::subscribe_order_book(
                 for (const auto& sob : resp.order_book()) {
                     for (const auto& row : sob.rows()) {
                         const double price = decimal_to_double(row.price());
-                        // ACTION_UNSPECIFIED=0, ACTION_REMOVE=1,
-                        // ACTION_ADD=2, ACTION_UPDATE=3
                         const int act = static_cast<int>(row.action());
                         constexpr int kRemove = 1;
 
@@ -298,19 +283,13 @@ SubscriptionHandle MarketDataClient::subscribe_order_book(
                             if (act == kRemove || qty < 1e-9)
                                 bids_map.erase(price);
                             else
-                                bids_map[price] = OrderBookRow{
-                                    price,
-                                    static_cast<int64_t>(qty)
-                                };
+                                bids_map[price] = OrderBookRow{price, static_cast<int64_t>(qty)};
                         } else if (row.has_sell_size()) {
                             const double qty = decimal_to_double(row.sell_size());
                             if (act == kRemove || qty < 1e-9)
                                 asks_map.erase(price);
                             else
-                                asks_map[price] = OrderBookRow{
-                                    price,
-                                    static_cast<int64_t>(qty)
-                                };
+                                asks_map[price] = OrderBookRow{price, static_cast<int64_t>(qty)};
                         }
                     }
 
@@ -341,12 +320,7 @@ SubscriptionHandle MarketDataClient::subscribe_order_book(
     });
 }
 
-// ── subscribe_latest_trades ───────────────────────────────────────────────────
-//
-// Side enum из proto/grpc/tradeapi/v1/side.proto:
-//   SIDE_BUY  → is_buy = true
-//   SIDE_SELL → is_buy = false
-//   SIDE_UNSPECIFIED → tick rule (price >= last_price)
+// ── subscribe_latest_trades ───────────────────────────────────────────────────────────
 
 SubscriptionHandle MarketDataClient::subscribe_latest_trades(
     const Symbol&  symbol,
@@ -384,8 +358,7 @@ SubscriptionHandle MarketDataClient::subscribe_latest_trades(
                     else if (t.side() == Side::SIDE_SELL)
                         is_buy = false;
                     else
-                        // Tick rule fallback для SIDE_UNSPECIFIED
-                        is_buy = (price >= last_price);
+                        is_buy = (price >= last_price);  // tick rule fallback
 
                     last_price = price;
 
@@ -414,9 +387,7 @@ SubscriptionHandle MarketDataClient::subscribe_latest_trades(
     });
 }
 
-// ── subscribe_book_events ─────────────────────────────────────────────────────
-// Адаптер над subscribe_order_book: диффит последовательные снапшоты
-// и эмитит BookLevelEvent для каждого изменившегося уровня 0..kBookLevels-1.
+// ── subscribe_book_events ───────────────────────────────────────────────────────────────
 
 SubscriptionHandle MarketDataClient::subscribe_book_events(
     const Symbol&     symbol,
