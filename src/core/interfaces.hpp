@@ -8,7 +8,7 @@
 
 namespace finam {
 
-// ── Ошибки ────────────────────────────────────────────────────────────────────
+// ── Ошибки ──────────────────────────────────────────────────────────────────────
 
 enum class ErrorCode : uint32_t {
     Ok = 0,
@@ -42,25 +42,22 @@ struct Error {
 template<typename T>
 using Result = std::expected<T, Error>;
 
-// ── Базовые типы ──────────────────────────────────────────────────────────────
+// ── Базовые типы ───────────────────────────────────────────────────────────────────
 
 using Timestamp = std::chrono::system_clock::time_point;
 
 // Идентификатор инструмента: формат API v2 — "{TICKER}-{MM}.{YY}@{MIC}"
-// Пример: Si-6.26@FORTS, RTS-6.26@FORTS
-// security_code = "Si-6.26", security_board = "FORTS"
 struct Symbol {
     std::string security_code;   // "Si-6.26", "RTS-6.26", "GOLD-6.26"
     std::string security_board;  // "FORTS" для срочного рынка MOEX
 
-    // Возвращает строку в формате API: "Si-6.26@FORTS"
     [[nodiscard]] std::string to_string() const {
         return security_code + "@" + security_board;
     }
     [[nodiscard]] bool operator==(const Symbol&) const = default;
 };
 
-// ── Рыночные данные ───────────────────────────────────────────────────────────
+// ── Рыночные данные ────────────────────────────────────────────────────────────────
 
 struct Quote {
     Symbol    symbol;
@@ -71,11 +68,14 @@ struct Quote {
     Timestamp ts;
 };
 
+// Bar содержит таймфрейм чтобы стратегия могла различать D1 от M1
+// Без этого поля detect_timeframe() был невозможен без heuristic по duration
 struct Bar {
-    Symbol    symbol;
-    double    open{}, high{}, low{}, close{};
-    int64_t   volume{};
-    Timestamp ts;
+    Symbol      symbol;
+    std::string timeframe;  // "D1", "M1", "M5", "H1" — заполняет MarketDataClient
+    double      open{}, high{}, low{}, close{};
+    int64_t     volume{};
+    Timestamp   ts;
 };
 
 struct OrderBookRow {
@@ -85,33 +85,33 @@ struct OrderBookRow {
 
 struct OrderBook {
     Symbol                    symbol;
-    std::vector<OrderBookRow> asks;  // по возрастанию цены
-    std::vector<OrderBookRow> bids;  // по убыванию цены
+    std::vector<OrderBookRow> asks;
+    std::vector<OrderBookRow> bids;
     Timestamp                 ts;
 };
 
-// ── Ордера ────────────────────────────────────────────────────────────────────
+// ── Ордера ──────────────────────────────────────────────────────────────────────
 
 enum class OrderSide   { Buy, Sell };
 enum class OrderStatus { Pending, PartialFill, Filled, Cancelled, Rejected };
 enum class OrderType   { Market, Limit };
 
 struct OrderUpdate {
-    int64_t     order_no{};       // биржевой номер
-    int32_t     transaction_id{}; // наш локальный ID
+    int64_t     order_no{};
+    int32_t     transaction_id{};
     Symbol      symbol;
-    std::string client_id;        // торговый счёт
+    std::string client_id;
     OrderSide   side{};
     OrderStatus status{};
     OrderType   type{};
     double      price{};
     int32_t     qty_total{};
     int32_t     qty_filled{};
-    std::string message;          // причина отказа если Rejected
+    std::string message;
     Timestamp   ts;
 };
 
-// ── Сигнал стратегии ──────────────────────────────────────────────────────────
+// ── Сигнал ──────────────────────────────────────────────────────────────────────
 
 struct Signal {
     enum class Direction { Buy, Sell, Close, None };
@@ -119,23 +119,23 @@ struct Signal {
     Symbol      symbol;
     Direction   direction{Direction::None};
     OrderType   order_type{OrderType::Market};
-    double      price{};      // игнорируется при Market
+    double      price{};
     int32_t     quantity{};
-    std::string reason;       // для логов
+    std::string reason;
 };
 
-// ── Запрос на выставление ордера ──────────────────────────────────────────────
+// ── Запрос на выставление ордера ───────────────────────────────────────────────
 
 struct OrderRequest {
-    std::string client_id;    // торговый счёт
+    std::string client_id;
     Symbol      symbol;
     OrderSide   side{};
     OrderType   type{OrderType::Market};
-    double      price{};      // только для Limit
+    double      price{};
     int32_t     quantity{};
 };
 
-// ── Интерфейсы компонентов ────────────────────────────────────────────────────
+// ── Интерфейсы ───────────────────────────────────────────────────────────────────
 
 class IStrategy {
 public:
@@ -152,7 +152,6 @@ class IOrderExecutor {
 public:
     virtual ~IOrderExecutor() = default;
 
-    // Возвращает transaction_id
     virtual Result<int32_t> submit(const OrderRequest& req)    = 0;
     virtual Result<void>    cancel(int64_t order_no,
                                    std::string_view client_id) = 0;

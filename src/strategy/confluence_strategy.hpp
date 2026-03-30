@@ -12,20 +12,19 @@
 
 namespace finam::strategy {
 
-// ── ConfluenceStrategy ────────────────────────────────────────────────────
+// ── ConfluenceStrategy ────────────────────────────────────────────────────────────
 //
-// Логика входа (все условия AND):
+// detect_timeframe() — по полю Bar::timeframe (заполняет MarketDataClient).
+// StrategyRunner запрашивает D1 через get_bars("D1") и subscribe_bars("M1"),
+// поэтому стратегия получает бары с уже заполненным timeframe.
+//
+// Логика входа (AND):
 //   [1] orb_finalized && bias != None
-//   [2] mlofi.vote() == tfi.vote()          (оба согласны)
-//   [3] ofi_vote.is_strong()                (confluence == ±2)
-//   [4] vote направление == ORB bias
+//   [2] mlofi.vote() == tfi.vote()
+//   [3] ofi_vote.is_strong() (confluence == ±2)
+//   [4] vote == ORB bias
 //   [5] !spoof_filter.is_spoofed(bbo)
 //
-// Логика выхода:
-//   [A] Противоположный сильный сигнал
-//   [B] pnl < -sl_ticks  или  pnl > tp_ticks
-//
-// Размер: base_qty * session_context.size_multiplier()
 // THREADING: все методы из одного strategy thread.
 
 class ConfluenceStrategy final : public IStrategy {
@@ -51,16 +50,24 @@ public:
         , session_ctx_(cfg.session_cfg)
     {}
 
-    // ── IStrategy ─────────────────────────────────────────────────────────
+    // ── IStrategy ──────────────────────────────────────────────────────────────────
 
     Signal on_bar(const Bar& bar) override {
         if (bar.symbol != cfg_.symbol) return no_signal();
-        const auto tf = detect_timeframe(bar);
-        if (tf == Timeframe::Daily)
-            session_ctx_.on_daily_bar(bar);
-        else if (tf == Timeframe::Intraday) {
-            handle_session_open(bar.ts);
-            session_ctx_.on_intraday_bar(bar);
+        // detect_timeframe() читает bar.timeframe — заполняет MarketDataClient
+        switch (detect_timeframe(bar)) {
+            case Timeframe::Daily:
+                session_ctx_.on_daily_bar(bar);
+                spdlog::debug("[Confluence] D1 bar: atr={:.1f} nr7={}",
+                    session_ctx_.atr(), session_ctx_.nr7_confirmed());
+                break;
+            case Timeframe::Intraday:
+                handle_session_open(bar.ts);
+                session_ctx_.on_intraday_bar(bar);
+                break;
+            case Timeframe::Unknown:
+                spdlog::warn("[Confluence] unknown timeframe: '{}'", bar.timeframe);
+                break;
         }
         return no_signal();
     }
@@ -101,7 +108,7 @@ public:
 
     [[nodiscard]] const Symbol& symbol() const noexcept { return cfg_.symbol; }
 
-    // ── OFI event pipeline (из MD consumer) ──────────────────────────────
+    // ── OFI event pipeline ───────────────────────────────────────────────────────────
 
     std::optional<Signal> on_book_event(const BookLevelEvent& e) {
         update_spoof_on_book(e);
@@ -135,6 +142,18 @@ public:
 private:
     enum class Timeframe { Daily, Intraday, Unknown };
 
+    // ── detect_timeframe ────────────────────────────────────────────────────────────
+    // Читаем bar.timeframe — дополняет Bar строкой таймфрейма.
+    // D1/W1 → Daily, всё остальное → Intraday, пустое → Unknown.
+    [[nodiscard]] static Timeframe detect_timeframe(const Bar& bar) noexcept {
+        const auto& tf = bar.timeframe;
+        if (tf == "D1" || tf == "W1") return Timeframe::Daily;
+        if (tf.empty())               return Timeframe::Unknown;
+        return Timeframe::Intraday;   // M1, M5, H1, ...
+    }
+
+    // ── try_enter ───────────────────────────────────────────────────────────────────
+
     std::optional<Signal> try_enter(
         std::chrono::system_clock::time_point ts,
         double price) noexcept
@@ -156,7 +175,6 @@ private:
         };
 
         if (!vote.is_strong()) return std::nullopt;
-
         if (vote.is_long()  && !session_ctx_.allows_long())  return std::nullopt;
         if (vote.is_short() && !session_ctx_.allows_short()) return std::nullopt;
 
@@ -173,8 +191,10 @@ private:
         const int32_t qty  = static_cast<int32_t>(
             cfg_.base_qty * session_ctx_.size_multiplier());
 
-        spdlog::info("[Confluence] ENTRY {} qty={} price={:.2f} nr7={} mlofi={} tfi={}",
+        spdlog::info("[Confluence] ENTRY {} qty={} price={:.2f} "
+                     "atr={:.1f} nr7={} mlofi={} tfi={}",
             is_long ? "LONG" : "SHORT", qty, price,
+            session_ctx_.atr(),
             session_ctx_.nr7_confirmed(),
             static_cast<int>(vote.mlofi),
             static_cast<int>(vote.tfi));
@@ -211,7 +231,6 @@ private:
         const int8_t conf = static_cast<int8_t>(
             static_cast<int>(ob_state_.vote()) +
             static_cast<int>(tfi_analyzer_.vote()));
-
         if ((position_ > 0 && conf == -2) || (position_ < 0 && conf == 2)) {
             spdlog::info("[Confluence] flow reversal exit");
             return close_signal("flow_reversal");
@@ -262,15 +281,11 @@ private:
         return static_cast<int>((tt % 86400) / 60);
     }
 
-    [[nodiscard]] Timeframe detect_timeframe(const Bar&) const noexcept {
-        return Timeframe::Intraday; // TODO: разделить D1/M1 через StrategyRunner
-    }
-
     [[nodiscard]] static Signal no_signal() noexcept {
         return Signal{.direction = Signal::Direction::None};
     }
 
-    // ── State ─────────────────────────────────────────────────────────────
+    // ── State ───────────────────────────────────────────────────────────────────
 
     Config            cfg_;
     OrderBookState    ob_state_;
