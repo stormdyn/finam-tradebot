@@ -3,7 +3,9 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <core/interfaces.hpp>
 #include <auth/token_manager.hpp>
 

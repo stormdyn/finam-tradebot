@@ -7,6 +7,9 @@
 #include <core/grpc_fmt.hpp>
 #include <spdlog/spdlog.h>
 
+// Имена сервисов в реальном API:
+//   AccountsService (не AccountService) — GetAccount (GetAccountResponse.portfolio_forts)
+//   AssetsService                        — GetAssetParams (GetAssetParamsResponse)
 #include "grpc/tradeapi/v1/accounts/accounts_service.grpc.pb.h"
 #include "grpc/tradeapi/v1/assets/assets_service.grpc.pb.h"
 
@@ -64,24 +67,30 @@ Result<void> RiskManager::refresh_account() {
     grpc::ClientContext ctx;
     ctx.AddMetadata("authorization", "Bearer " + token_mgr_->jwt());
 
-    proto_acc::GetPortfolioRequest req;
+    // Реальный API: GetAccount(аккаунт) → GetAccountResponse
+    // FORTS-портфель: oneof portfolio { FORTS portfolio_forts }
+    // FORTS.available_cash — доступные средства (свободная маржа)
+    // FORTS.money_reserved  — зарезервированная маржа (под открытые позиции)
+    // GetAccountResponse.equity — стоимость портфеля (liquid_value)
+    // GetAccountResponse.unrealized_profit — нереализованный PnL (daily_pnl аппроксимация)
+    // GetAccountResponse.positions — список позиций
+    proto_acc::GetAccountRequest req;
     req.set_account_id(std::string(token_mgr_->primary_account_id()));
 
-    proto_acc::GetPortfolioResponse resp;
-    const auto status = stub->GetPortfolio(&ctx, req, &resp);
+    proto_acc::GetAccountResponse resp;
+    const auto status = stub->GetAccount(&ctx, req, &resp);
     if (!status.ok()) {
-        spdlog::error("[Risk] GetPortfolio failed: code={} msg={}",
+        spdlog::error("[Risk] GetAccount failed: code={} msg={}",
             status.error_code(), status.error_message());
         return std::unexpected(Error{ErrorCode::RpcError, status.error_message()});
     }
 
-    const auto& forts = resp.portfolio_forts();
     AccountState s;
-    s.liquid_value   = decimal_to_double(forts.liquid_value());
-    s.used_margin    = decimal_to_double(forts.used_margin());
-    s.free_margin    = decimal_to_double(forts.free_margin());
-    s.open_positions = static_cast<double>(forts.positions_size());
-    s.daily_pnl      = decimal_to_double(forts.daily_pnl());
+    s.liquid_value   = decimal_to_double(resp.equity());
+    s.used_margin    = decimal_to_double(resp.portfolio_forts().money_reserved());
+    s.free_margin    = decimal_to_double(resp.portfolio_forts().available_cash());
+    s.daily_pnl      = decimal_to_double(resp.unrealized_profit());
+    s.open_positions = static_cast<double>(resp.positions_size());
     s.updated_at     = std::chrono::system_clock::now();
 
     {
@@ -90,8 +99,8 @@ Result<void> RiskManager::refresh_account() {
         if (s.liquid_value > peak_liquid_)
             peak_liquid_ = s.liquid_value;
     }
-    spdlog::debug("[Risk] account: liquid={:.0f} free_margin={:.0f} "
-                  "daily_pnl={:.0f} positions={:.0f}",
+    spdlog::debug("[Risk] account: equity={:.0f} free_margin={:.0f} "
+                  "unrealized_pnl={:.0f} positions={:.0f}",
         s.liquid_value, s.free_margin, s.daily_pnl, s.open_positions);
     return {};
 }
@@ -162,24 +171,30 @@ AccountState RiskManager::account_state() const {
 Result<double> RiskManager::fetch_initial_margin(
     const Symbol& sym, bool is_long) const
 {
+    // Реальный API: GetAssetParams — не GetTradingInfo
+    // Поля: long_initial_margin / short_initial_margin (биржевое ГО для FORTS)
     auto stub = proto_assets::AssetsService::NewStub(token_mgr_->channel());
     grpc::ClientContext ctx;
     ctx.AddMetadata("authorization", "Bearer " + token_mgr_->jwt());
 
-    proto_assets::GetTradingInfoRequest req;
+    proto_assets::GetAssetParamsRequest req;
     req.set_symbol(sym.to_string());
     req.set_account_id(std::string(token_mgr_->primary_account_id()));
 
-    proto_assets::GetTradingInfoResponse resp;
-    const auto status = stub->GetTradingInfo(&ctx, req, &resp);
+    proto_assets::GetAssetParamsResponse resp;
+    const auto status = stub->GetAssetParams(&ctx, req, &resp);
     if (!status.ok()) {
-        spdlog::warn("[Risk] GetTradingInfo failed for {}: {}",
+        spdlog::warn("[Risk] GetAssetParams failed for {}: {}",
             sym.to_string(), status.error_message());
         return std::unexpected(Error{ErrorCode::RpcError, status.error_message()});
     }
-    return is_long
-        ? decimal_to_double(resp.long_initial_margin())
-        : decimal_to_double(resp.short_initial_margin());
+    // long_initial_margin / short_initial_margin — google.type.Money:
+    //   units (int64) — целая часть, nanos (int32) — дробная (1/10^9)
+    const auto& margin = is_long
+        ? resp.long_initial_margin()
+        : resp.short_initial_margin();
+    return static_cast<double>(margin.units()) +
+           static_cast<double>(margin.nanos()) / 1e9;
 }
 
 // ── check ─────────────────────────────────────────────────────────────────────────────
