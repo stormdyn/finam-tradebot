@@ -1,13 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <grpcpp/grpcpp.h>
-#include <grpcpp/test/mock_stream.h>
 #include <thread>
 #include <atomic>
 
 // ── Mock AuthService ────────────────────────────────────────────────────────────────
 //
 // Запускаем встроенный gRPC-сервер в памяти (без сети).
-// TokenManager подключаемся к нему через localhost:порт.
+// TokenManager подключается к нему через localhost:port.
 //
 // Трейдофф: используем grpc::ServerBuilder, а не GoogleMock-стабы,
 // чтобы не зависеть от gmock. Тест верифицирует весь auth-флоу.
@@ -17,46 +16,50 @@
 
 namespace proto_auth = ::grpc::tradeapi::v1::auth;
 
-// ── MockAuthService (in-process gRPC impl) ────────────────────────────────────
+// ── MockAuthServiceImpl (in-process gRPC impl) ───────────────────────────────
 
 class MockAuthServiceImpl final
     : public proto_auth::AuthService::Service
 {
 public:
-    // Auth(secret) → возвращаем jwt="test_jwt"
+    // Auth(secret) → возвращаем token="test_jwt"
+    // Поле запроса: secret (не secret_token)
     grpc::Status Auth(
         grpc::ServerContext*,
         const proto_auth::AuthRequest* req,
         proto_auth::AuthResponse* resp) override
     {
-        if (req->secret_token() == "valid_secret") {
-            resp->set_jwt("test_jwt");
+        if (req->secret() == "valid_secret") {
+            resp->set_token("test_jwt");
             return grpc::Status::OK;
         }
         return grpc::Status{grpc::StatusCode::UNAUTHENTICATED, "bad secret"};
     }
 
-    // TokenDetails(jwt) → account_ids=["ACC001"]
+    // TokenDetails(token) → account_ids=["ACC001"]
+    // Поле запроса: token (не jwt)
     grpc::Status TokenDetails(
         grpc::ServerContext*,
         const proto_auth::TokenDetailsRequest* req,
         proto_auth::TokenDetailsResponse* resp) override
     {
-        if (req->jwt() == "test_jwt") {
+        if (req->token() == "test_jwt") {
             resp->add_account_ids("ACC001");
             return grpc::Status::OK;
         }
         return grpc::Status{grpc::StatusCode::UNAUTHENTICATED, "bad jwt"};
     }
 
-    // SubscribeJwtRenewal — шлём один renewal и закрываем поток
+    // SubscribeJwtRenewal — шлём один renewal и ждём отмены клиента
+    // Тип ответа: SubscribeJwtRenewalResponse (не JwtRenewalEvent)
+    // Поле ответа: token (не jwt)
     grpc::Status SubscribeJwtRenewal(
         grpc::ServerContext* ctx,
         const proto_auth::SubscribeJwtRenewalRequest*,
-        grpc::ServerWriter<proto_auth::JwtRenewalEvent>* writer) override
+        grpc::ServerWriter<proto_auth::SubscribeJwtRenewalResponse>* writer) override
     {
-        proto_auth::JwtRenewalEvent ev;
-        ev.set_jwt("renewed_jwt");
+        proto_auth::SubscribeJwtRenewalResponse ev;
+        ev.set_token("renewed_jwt");
         writer->Write(ev);
         // Ждём отмены от клиента
         while (!ctx->IsCancelled())
@@ -65,7 +68,7 @@ public:
     }
 };
 
-// ── Фикстура: запуск/остановка сервера ─────────────────────────────────
+// ── Фикстура: запуск/остановка сервера ──────────────────────────────────────
 
 struct GrpcFixture {
     MockAuthServiceImpl  service;
@@ -73,7 +76,7 @@ struct GrpcFixture {
     std::string          addr;
 
     GrpcFixture() {
-        // Адрес 0 — OS выберет свободный порт
+        // port=0 — OS выбирает свободный порт
         int port = 0;
         grpc::ServerBuilder builder;
         builder.AddListeningPort("localhost:0",
@@ -88,7 +91,7 @@ struct GrpcFixture {
     }
 };
 
-// ── Тесты ────────────────────────────────────────────────────────────────────────
+// ── Тесты ──────────────────────────────────────────────────────────────────────
 
 TEST_CASE("Auth flow: valid secret obtains JWT and account_id",
           "[integration][auth]")
@@ -138,9 +141,10 @@ TEST_CASE("JWT renewal: SubscribeJwtRenewal emits renewed_jwt",
     };
     REQUIRE(mgr.init("valid_secret").has_value());
 
-    // Запускаем реньюал-поток, ждём первого реньюала
-    mgr.start_jwt_renewal();
-    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    // Фоновый renewal-поток уже запущен внутри init().
+    // Ждём первого события (mock шлёт сразу после подключения).
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
     CHECK(mgr.jwt() == "renewed_jwt");
+
     mgr.shutdown();
 }

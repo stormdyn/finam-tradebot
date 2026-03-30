@@ -36,10 +36,11 @@ public:
     {}
 
     // Ждём с проверкой stop каждые tick мс.
-    // Возвращает: true — надо реконнектиться, false — остановка
+    // Возвращает: true — надо реконнектиться, false — остановка.
+    // Инкрементирует attempt_ только при успешном завершении ожидания.
     template<typename StopFlag>
     [[nodiscard]] bool wait(const StopFlag& stop) noexcept {
-        const auto delay = next_delay();
+        const auto delay = compute_delay();  // читает attempt_ без изменения
         auto remaining   = delay;
         while (remaining > std::chrono::milliseconds::zero()) {
             if (stop.load(std::memory_order_acquire)) return false;
@@ -51,12 +52,21 @@ public:
         return true;
     }
 
+    // Возвращает задержку для текущего attempt_ и инкрементирует attempt_.
+    // Используется в тестах для проверки последовательности задержек.
+    [[nodiscard]] std::chrono::milliseconds next_delay() noexcept {
+        auto d = compute_delay();
+        ++attempt_;
+        return d;
+    }
+
     void reset() noexcept { attempt_ = 0; }
 
     [[nodiscard]] int attempt() const noexcept { return attempt_; }
 
 private:
-    [[nodiscard]] std::chrono::milliseconds next_delay() noexcept {
+    // Вычисляет задержку по текущему attempt_ без изменения состояния
+    [[nodiscard]] std::chrono::milliseconds compute_delay() noexcept {
         // base * 2^attempt, зажато до cap
         const double raw = static_cast<double>(cfg_.base.count())
                          * (1LL << std::min(attempt_, 6));  // max 64x

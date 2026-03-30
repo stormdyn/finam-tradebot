@@ -11,6 +11,9 @@ target_include_directories(integration_tests PRIVATE
 
 target_link_libraries(integration_tests PRIVATE
     Catch2::Catch2WithMain
+    finam_auth
+    finam_core
+    finam_proto
     gRPC::grpc++
     protobuf::libprotobuf
     spdlog::spdlog

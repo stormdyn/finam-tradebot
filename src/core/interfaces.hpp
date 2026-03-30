@@ -76,6 +76,8 @@ struct Bar {
     double      open{}, high{}, low{}, close{};
     int64_t     volume{};
     Timestamp   ts;
+    // date: используется в backtest для человеческого лога/CSV (заполняет load_csv)
+    std::string date;
 };
 
 struct OrderBookRow {

@@ -18,10 +18,10 @@ static ConfluenceStrategy::Config make_cfg() {
 static Bar make_d1(double o, double h, double l, double c) {
     return Bar{
         .symbol    = Symbol{"Si-6.26", "FORTS"},
+        .timeframe = "D1",
         .open = o, .high = h, .low = l, .close = c,
         .volume    = 1000,
         .ts        = std::chrono::system_clock::now(),
-        .timeframe = "D1",
     };
 }
 
@@ -81,10 +81,10 @@ TEST_CASE("ConfluenceStrategy: no entry without ORB finalized", "[confluence]") 
     ConfluenceStrategy strat{make_cfg()};
     // Без накопленных D1 баров orb не финализирован
     BookLevelEvent e{
-        .symbol       = Symbol{"Si-6.26", "FORTS"},
+        .level        = 0,
         .price        = 100.0,
-        .new_bid_size = 100.0, .old_bid_size = 0.0,
-        .new_ask_size = 0.0,   .old_ask_size = 0.0,
+        .old_bid_size = 0.0, .new_bid_size = 100.0,
+        .old_ask_size = 0.0, .new_ask_size = 0.0,
         .ts           = std::chrono::system_clock::now(),
     };
     const auto sig = strat.on_book_event(e);

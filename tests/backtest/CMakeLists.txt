@@ -9,6 +9,8 @@ target_include_directories(backtest_runner PRIVATE
 )
 
 target_link_libraries(backtest_runner PRIVATE
+    finam_core
+    finam_strategy
     spdlog::spdlog
     project_warnings
 )

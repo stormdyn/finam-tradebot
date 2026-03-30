@@ -8,10 +8,14 @@ add_executable(unit_tests
 
 target_include_directories(unit_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated/proto
 )
 
 target_link_libraries(unit_tests PRIVATE
     Catch2::Catch2WithMain
+    finam_core
+    finam_risk
+    finam_strategy
     spdlog::spdlog
     project_warnings
 )

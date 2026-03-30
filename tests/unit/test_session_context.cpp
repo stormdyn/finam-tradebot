@@ -11,10 +11,10 @@ static Bar make_bar(double o, double h, double l, double c,
 {
     return Bar{
         .symbol    = Symbol{"Si-6.26", "FORTS"},
+        .timeframe = std::string(tf),
         .open      = o, .high = h, .low = l, .close = c,
         .volume    = 1000,
         .ts        = std::chrono::system_clock::now(),
-        .timeframe = std::string(tf),
     };
 }
 
@@ -52,10 +52,17 @@ TEST_CASE("SessionContext: ORB bias set after finalize", "[session]") {
     CHECK_FALSE(ctx.allows_short());
 }
 
-TEST_CASE("SessionContext: size_multiplier > 1 with NR7", "[session]") {
-    SessionContext ctx{};
+TEST_CASE("SessionContext: size_multiplier == 1 with NR7 (vs 0.5 without)", "[session]") {
+    // Без NR7 — базовый множитель 0.5 (осторожный размер позиции)
+    SessionContext ctx_no_nr7{};
+    ctx_no_nr7.on_daily_bar(make_bar(100, 120, 80, 110));  // один бар, NR7 не готов
+    CHECK(ctx_no_nr7.size_multiplier() == 0.5);
+
+    // С NR7 — полный множитель 1.0
+    SessionContext ctx_nr7{};
     for (int i = 0; i < 6; ++i)
-        ctx.on_daily_bar(make_bar(100, 120, 80, 110));
-    ctx.on_daily_bar(make_bar(100, 105, 98, 103));
-    CHECK(ctx.size_multiplier() > 1.0f);
+        ctx_nr7.on_daily_bar(make_bar(100, 120, 80, 110));
+    ctx_nr7.on_daily_bar(make_bar(100, 105, 98, 103));
+    CHECK(ctx_nr7.size_multiplier() == 1.0);
+    CHECK(ctx_nr7.size_multiplier() > ctx_no_nr7.size_multiplier());
 }

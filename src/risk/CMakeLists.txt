@@ -11,6 +11,6 @@ target_link_libraries(finam_risk PUBLIC
     finam_auth
     gRPC::grpc++
     protobuf::libprotobuf
-    finamproto
+    finam_proto
     spdlog::spdlog
 )
