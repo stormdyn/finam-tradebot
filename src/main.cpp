@@ -10,7 +10,8 @@
 #include "risk/risk_manager.hpp"
 #include "strategy/strategy_runner.hpp"
 
-// ── Graceful shutdown ───────────────────────────────────────────────────────────────
+// ── Graceful shutdown ─────────────────────────────────────────────────────────────────
+
 static std::atomic<bool> g_shutdown{false};
 
 static void signal_handler(int) noexcept {
@@ -25,14 +26,14 @@ int main() {
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    // ── Env ──────────────────────────────────────────────────────────────────────
+    // ── Env ──────────────────────────────────────────────────────────────────────────
     const char* secret_env = std::getenv("FINAM_SECRET_TOKEN");
     if (!secret_env) {
         spdlog::critical("FINAM_SECRET_TOKEN not set");
         return 1;
     }
 
-    // ── Auth ────────────────────────────────────────────────────────────────────
+    // ── Auth ───────────────────────────────────────────────────────────────────────
     auto token_mgr = std::make_shared<finam::auth::TokenManager>(
         finam::auth::TokenManagerConfig{
             .endpoint = "api.finam.ru:443",
@@ -43,9 +44,10 @@ int main() {
         spdlog::critical("Auth failed: {}", r.error().message);
         return 1;
     }
-    spdlog::info("Authenticated, account: {}", token_mgr->primary_account_id());
+    const std::string account_id{token_mgr->primary_account_id()};
+    spdlog::info("Authenticated, account: {}", account_id);
 
-    // ── Risk ────────────────────────────────────────────────────────────────────
+    // ── Risk ───────────────────────────────────────────────────────────────────────
     auto risk = std::make_shared<finam::risk::RiskManager>(
         finam::risk::RiskConfig{
             .per_trade_pct      = 2.0,
@@ -57,26 +59,21 @@ int main() {
         },
         token_mgr
     );
-    risk->start();  // запускает poll thread (GetPortfolio раз в 10 с)
+    risk->start();
 
-    // ── Market data ───────────────────────────────────────────────────────────
+    // ── Market data ─────────────────────────────────────────────────────────────
     auto md = std::make_shared<finam::market_data::MarketDataClient>(token_mgr);
 
-    // ── Order executor ──────────────────────────────────────────────────────────
-    const std::string account_id{token_mgr->primary_account_id()};
+    // ── OrderClient ───────────────────────────────────────────────────────────────────
+    //
+    // Конструируем OrderClient без callback — подключим позже через StrategyRunner.
+    // Порядок важен: runner владеет стратегией и знает куда маршрутизировать on_order_update.
     auto order_client = std::make_shared<finam::order::OrderClient>(
-        token_mgr,
-        account_id,
-        [](const finam::OrderUpdate& upd) {
-            spdlog::info("[order] id={} symbol={} status={} filled={}",
-                upd.transaction_id,
-                upd.symbol.to_string(),
-                static_cast<int>(upd.status),
-                upd.qty_filled);
-        }
+        token_mgr, account_id
+        // callback передаётся позже через set_update_callback()
     );
 
-    // ── Strategy ───────────────────────────────────────────────────────────────
+    // ── StrategyRunner ─────────────────────────────────────────────────────────────
     finam::strategy::StrategyRunner::Config runner_cfg{
         .strategy = finam::strategy::ConfluenceStrategy::Config{
             .symbol    = finam::Symbol{"Si-6.26", "FORTS"},
@@ -89,21 +86,29 @@ int main() {
         .poll_interval = std::chrono::microseconds{100},
     };
 
+    // Runner создаётся до set_update_callback — потому принимает order_client по IOrderExecutor.
+    // StrategyRunner сам регистрирует on_update_ через set_update_callback() в конструкторе.
     auto runner = std::make_unique<finam::strategy::StrategyRunner>(
         runner_cfg, md, order_client, token_mgr, risk
     );
 
+    // Теперь вызываем set_update_callback: runner уже готов, strategy_thread_ запущен.
+    // Коллбэк вызывается из order stream thread OrderClient —
+    // он доставляет событие в strategy thread через SPSC-очередь.
+    order_client->set_update_callback(runner->make_order_callback());
+
     spdlog::info("Strategy running, press Ctrl+C to stop");
 
-    // ── Main loop ────────────────────────────────────────────────────────────────
+    // ── Main loop ───────────────────────────────────────────────────────────────────
     while (!g_shutdown.load(std::memory_order_acquire))
         std::this_thread::sleep_for(std::chrono::seconds{1});
 
-    // ── Graceful shutdown ──────────────────────────────────────────────────────────
+    // ── Graceful shutdown ─────────────────────────────────────────────────────────────
     spdlog::info("Shutting down...");
-    runner.reset();       // join strategy_thread_, cancel subscriptions
-    risk->shutdown();     // join poll_thread_
-    token_mgr->shutdown(); // join renewal_thread_
+    runner.reset();          // join strategy_thread_, cancel subscriptions
+    order_client->shutdown(); // join order stream
+    risk->shutdown();         // join poll_thread_
+    token_mgr->shutdown();    // join renewal_thread_
     spdlog::info("finam-tradebot stopped");
     return 0;
 }

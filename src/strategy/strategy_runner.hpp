@@ -15,13 +15,17 @@
 
 namespace finam::strategy {
 
-// StrategyRunner — владелец стратегии, подписок и strategy thread.
+// ── StrategyRunner ───────────────────────────────────────────────────────────────────
 //
 // Threading model:
-//   gRPC MD thread 1/2  →  push() в queue_  →  strategy_thread_ (consumer)
-//   strategy_thread_    →  risk_->check()   →  executor_->submit()
+//   gRPC MD threads      →  queue_.push()         →  strategy_thread_ (consumer)
+//   OrderClient stream   →  queue_.push(OrderUpdate) →  strategy_thread_
+//   strategy_thread_     →  risk_->check()        →  executor_->submit()
 //
-// RiskManager::check() — shared_lock внутри, не блокирует polling thread.
+// Почему OrderUpdate через очередь, а не напрямую в on_order_update:
+// — избегаем data race с position_ в ConfluenceStrategy (Strategy не thread-safe).
+// — порядок событий сохраняется (FIFO в очереди).
+
 class StrategyRunner {
 public:
     struct Config {
@@ -57,13 +61,35 @@ public:
     StrategyRunner(const StrategyRunner&)            = delete;
     StrategyRunner& operator=(const StrategyRunner&) = delete;
 
+    // ── Public API ──────────────────────────────────────────────────────────────────
+
+    // Возвращает callback для OrderClient::set_update_callback().
+    // Коллбэк вызывается из order stream thread — пушим в SPSC-очередь,
+    // не заходим прямо в strategy (Single Producer — order thread).
+    [[nodiscard]] finam::order::OrderUpdateCallback make_order_callback() {
+        return [this](const OrderUpdate& upd) {
+            // risk on_fill — thread-safe через atomic/mutex внутри RiskManager
+            if (risk_ &&
+                (upd.status == OrderStatus::Filled ||
+                 upd.status == OrderStatus::PartialFill) &&
+                upd.qty_filled > 0)
+            {
+                risk_->on_fill(upd);
+            }
+            // strategy.on_order_update — не thread-safe, пушим через очередь
+            if (!queue_.push(upd))
+                spdlog::warn("[Runner] order_queue full, OrderUpdate dropped");
+        };
+    }
+
 private:
-    using MdEvent = std::variant<BookLevelEvent, TradeEvent, Quote>;
+    // OrderUpdate добавлен в вариант для SPSC-очереди
+    using MdEvent = std::variant<BookLevelEvent, TradeEvent, Quote, OrderUpdate>;
 
     static constexpr std::size_t kQueueSize = 1024;
     using Queue = core::SpscQueue<MdEvent, kQueueSize>;
 
-    // ── Strategy thread ──────────────────────────────────────────────────────────
+    // ── Strategy thread ───────────────────────────────────────────────────────────────
 
     void start_strategy_thread() {
         strategy_thread_ = std::thread([this] {
@@ -96,12 +122,17 @@ private:
         if (sig.direction != Signal::Direction::None) handle_signal(sig);
     }
 
-    // ── Subscriptions ─────────────────────────────────────────────────────────────
+    // Отдельный dispatch для OrderUpdate — вызываем strategy в strategy thread
+    void dispatch(const OrderUpdate& upd) noexcept {
+        strategy_.on_order_update(upd);
+    }
+
+    // ── Subscriptions ────────────────────────────────────────────────────────────────
 
     void start_subscriptions() {
         const auto& sym = strategy_.symbol();
 
-        book_sub_  = md_->subscribe_book_events(sym,
+        book_sub_ = md_->subscribe_book_events(sym,
             [this](const BookLevelEvent& e) {
                 if (!queue_.push(e))
                     spdlog::warn("[Runner] book_queue full, event dropped");
@@ -119,14 +150,19 @@ private:
                     spdlog::warn("[Runner] quote_queue full, event dropped");
             });
 
-        // M1 бары — редкие, не проходят через queue
-        bar_sub_ = md_->subscribe_bars(sym, "M1",
+        // M1 бары — редкие, не через queue (нет contention с MD-потокам)
+        m1_bar_sub_ = md_->subscribe_bars(sym, "M1",
             [this](const Bar& bar) { strategy_.on_bar(bar); });
 
-        spdlog::info("[Runner] subscriptions started");
+        // D1 бары live — нужны для обновления ATR/NR7 в реальном времени
+        // Примечание: D1-бар закрывается раз в сутки, поэтому также не через queue
+        d1_bar_sub_ = md_->subscribe_bars(sym, "D1",
+            [this](const Bar& bar) { strategy_.on_bar(bar); });
+
+        spdlog::info("[Runner] subscriptions started (book/trade/quote/M1/D1)");
     }
 
-    // ── History ───────────────────────────────────────────────────────────────────
+    // ── History ──────────────────────────────────────────────────────────────────────
 
     void load_history(const Config& cfg) {
         const auto to   = std::chrono::system_clock::now();
@@ -141,7 +177,7 @@ private:
         spdlog::info("[Runner] loaded {} D1 bars", result->size());
     }
 
-    // ── Signal execution (only from strategy_thread_) ──────────────────────
+    // ── Signal execution (только из strategy_thread_) ──────────────────────────────────
 
     void handle_signal(const Signal& sig) {
         if (sig.direction == Signal::Direction::None) return;
@@ -157,19 +193,14 @@ private:
             .quantity  = sig.quantity,
         };
 
-        // ── Risk check до отправки ордера ───────────────────────────────
-        // Close-сигналы проходят без risk-проверки: закрытие позиции
-        // всегда разрешено — даже при circuit breaker
+        // Close-сигналы проходят без risk-проверки
         if (risk_ && !is_close) {
             if (auto r = risk_->check(req); !r) {
-                spdlog::warn("[Runner] risk check REJECTED {}: {}",
+                spdlog::warn("[Runner] risk REJECTED {}: {}",
                     sig.symbol.to_string(), r.error().message);
-
-                // Автотрип circuit breaker при critical ошибках
                 if (r.error().code == ErrorCode::DailyLossLimitHit ||
                     r.error().code == ErrorCode::RiskLimitExceeded)
                     risk_->trip_circuit_breaker(r.error().message);
-
                 return;
             }
         }
@@ -181,18 +212,17 @@ private:
             sig.direction == Signal::Direction::Close ? "CLOSE": "?",
             sig.quantity);
 
-        auto result = executor_->submit(req);
-        if (!result)
+        if (auto result = executor_->submit(req); !result)
             spdlog::error("[Runner] order rejected: {}", result.error().message);
     }
 
-    // ── Members ───────────────────────────────────────────────────────────────────
+    // ── Members ──────────────────────────────────────────────────────────────────────
 
     ConfluenceStrategy                              strategy_;
     std::shared_ptr<market_data::MarketDataClient>  md_;
     std::shared_ptr<IOrderExecutor>                 executor_;
     std::shared_ptr<auth::TokenManager>             token_mgr_;
-    std::shared_ptr<risk::RiskManager>              risk_;      // nullable — без риска тоже работает
+    std::shared_ptr<risk::RiskManager>              risk_;
 
     Queue                        queue_;
     std::thread                  strategy_thread_;
@@ -202,7 +232,8 @@ private:
     market_data::SubscriptionHandle  book_sub_;
     market_data::SubscriptionHandle  trade_sub_;
     market_data::SubscriptionHandle  quote_sub_;
-    market_data::SubscriptionHandle  bar_sub_;
+    market_data::SubscriptionHandle  m1_bar_sub_;
+    market_data::SubscriptionHandle  d1_bar_sub_;  // live D1 для обновления ATR
 };
 
 } // namespace finam::strategy
