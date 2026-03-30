@@ -33,8 +33,9 @@ class StrategyRunner {
 public:
     struct Config {
         ConfluenceStrategy::Config strategy;
+        std::string  base_ticker;      // "Si", "RTS", "GOLD", "MIX" — тикер без серии
         int  history_days{20};
-        int  rollover_days{5};  // передаётся в nearest_contract()
+        int  rollover_days{5};         // передаётся в nearest_contract()
         std::chrono::microseconds poll_interval{100};
     };
 
@@ -69,6 +70,12 @@ public:
 
     [[nodiscard]] finam::order::OrderUpdateCallback make_order_callback() {
         return [this](const OrderUpdate& upd) {
+            // Filter by symbol: each runner only processes its own orders.
+            // In multi-symbol mode a shared OrderClient broadcasts to all
+            // runners, so we must discard updates for other instruments.
+            if (upd.symbol != active_symbol() && upd.symbol.security_code != "") {
+                return;  // not our symbol — skip
+            }
             if (risk_ &&
                 (upd.status == OrderStatus::Filled ||
                  upd.status == OrderStatus::PartialFill) &&
@@ -288,7 +295,7 @@ private:
     std::chrono::microseconds poll_interval_;
 
     // base ticker (без серии) — для nearest_contract()
-    std::string_view          base_ticker_{"Si"};
+    std::string               base_ticker_{cfg_.base_ticker};
 
     mutable std::mutex        sym_mu_;
     Symbol                    active_symbol_{strategy_.symbol()};
