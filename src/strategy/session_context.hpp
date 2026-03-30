@@ -19,13 +19,10 @@ public:
         uint8_t atr_period{14};
         double  atr_filter_mult{0.8};
         int     session_open_utc_min{420};
-
-        Config() = default;
     };
 
-    explicit SessionContext(Config cfg = {}) noexcept : cfg_(cfg) {}
-
-    // ── D1 бары (вызывать при инициализации, старые → новые) ───────────────
+    explicit SessionContext(Config cfg) noexcept : cfg_(cfg) {}
+    SessionContext() noexcept : SessionContext(Config{}) {}
 
     void on_daily_bar(const Bar& bar) noexcept {
         const double range = bar.high - bar.low;
@@ -36,8 +33,6 @@ public:
         update_atr(range);
         update_nr7();
     }
-
-    // ── M1/M5 бары текущей сессии ─────────────────────────────────────
 
     void on_intraday_bar(const Bar& bar) noexcept {
         if (orb_finalized_) return;

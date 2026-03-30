@@ -13,15 +13,18 @@ public:
         double level_decay{0.5};
         double time_decay_per_sec{0.9};
         double signal_threshold{3.0};
-
-        Config() = default;
     };
 
-    explicit OrderBookState(Config cfg = {}) noexcept
+    // Явный дефолтный конструктор вынесен за пределы Config — GCC
+    // не может обработать default member initializers внутреннего
+    // класса до окончания outer class, если Config используется в default argument.
+    explicit OrderBookState(Config cfg) noexcept
         : cfg_(cfg)
     {
         precompute_weights();
     }
+
+    OrderBookState() noexcept : OrderBookState(Config{}) {}
 
     MlofiResult on_book_event(const BookLevelEvent& e) noexcept {
         if (e.level < 0 || e.level >= kBookLevels) return last_result_;

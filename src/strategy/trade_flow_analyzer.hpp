@@ -15,11 +15,10 @@ public:
         double   large_print_mult{4.0};
         uint32_t avg_volume_period{100};
         double   signal_threshold{0.3};
-
-        Config() = default;
     };
 
-    explicit TradeFlowAnalyzer(Config cfg = {}) noexcept : cfg_(cfg) {}
+    explicit TradeFlowAnalyzer(Config cfg) noexcept : cfg_(cfg) {}
+    TradeFlowAnalyzer() noexcept : TradeFlowAnalyzer(Config{}) {}
 
     TfiResult on_trade(const TradeEvent& e) noexcept {
         evict_old(e.ts);
@@ -86,12 +85,12 @@ private:
 
     TfiResult build_result(const TradeEvent& e) noexcept {
         TfiResult r;
-        r.tfi      = normalized_tfi();
-        r.cvd      = cvd_;
-        r.velocity = static_cast<double>(velocity_window_.size());
+        r.tfi         = normalized_tfi();
+        r.cvd         = cvd_;
+        r.velocity    = static_cast<double>(velocity_window_.size());
         r.large_print = (e.volume > avg_volume() * cfg_.large_print_mult);
-        r.ts       = e.ts;
-        last_result_ = r;
+        r.ts          = e.ts;
+        last_result_  = r;
         return r;
     }
 

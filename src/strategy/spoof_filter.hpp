@@ -14,11 +14,10 @@ public:
         uint32_t             min_events{5};
         std::chrono::seconds spoof_window{60};
         std::chrono::seconds flag_ttl{300};
-
-        Config() = default;
     };
 
-    explicit SpoofFilter(Config cfg = {}) noexcept : cfg_(cfg) {}
+    explicit SpoofFilter(Config cfg) noexcept : cfg_(cfg) {}
+    SpoofFilter() noexcept : SpoofFilter(Config{}) {}
 
     void on_large_add(double price,
                       std::chrono::system_clock::time_point ts) noexcept {
