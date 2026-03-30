@@ -6,18 +6,19 @@
 
 namespace finam::strategy {
 
+struct SpoofFilterConfig {
+    double               min_large_qty{10.0};
+    double               max_cancel_ratio{0.80};
+    uint32_t             min_events{5};
+    std::chrono::seconds spoof_window{60};
+    std::chrono::seconds flag_ttl{300};
+};
+
 class SpoofFilter {
 public:
-    struct Config {
-        double               min_large_qty{10.0};
-        double               max_cancel_ratio{0.80};
-        uint32_t             min_events{5};
-        std::chrono::seconds spoof_window{60};
-        std::chrono::seconds flag_ttl{300};
-    };
+    using Config = SpoofFilterConfig;
 
-    explicit SpoofFilter(Config cfg) noexcept : cfg_(cfg) {}
-    SpoofFilter() noexcept : SpoofFilter(Config{}) {}
+    explicit SpoofFilter(Config cfg = {}) noexcept : cfg_(cfg) {}
 
     void on_large_add(double price,
                       std::chrono::system_clock::time_point ts) noexcept {

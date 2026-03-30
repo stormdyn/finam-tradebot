@@ -7,27 +7,25 @@
 
 namespace finam::strategy {
 
+struct TradeFlowAnalyzerConfig {
+    std::chrono::milliseconds tfi_window{5'000};
+    std::chrono::milliseconds velocity_window{1'000};
+    double   large_print_mult{4.0};
+    uint32_t avg_volume_period{100};
+    double   signal_threshold{0.3};
+};
+
 class TradeFlowAnalyzer {
 public:
-    struct Config {
-        std::chrono::milliseconds tfi_window{5'000};
-        std::chrono::milliseconds velocity_window{1'000};
-        double   large_print_mult{4.0};
-        uint32_t avg_volume_period{100};
-        double   signal_threshold{0.3};
-    };
+    using Config = TradeFlowAnalyzerConfig;
 
-    explicit TradeFlowAnalyzer(Config cfg) noexcept : cfg_(cfg) {}
-    TradeFlowAnalyzer() noexcept : TradeFlowAnalyzer(Config{}) {}
+    explicit TradeFlowAnalyzer(Config cfg = {}) noexcept : cfg_(cfg) {}
 
     TfiResult on_trade(const TradeEvent& e) noexcept {
         evict_old(e.ts);
-
         window_.push_back(e);
         cvd_ += e.is_buy ? e.volume : -e.volume;
-
         update_avg_volume(e.volume);
-
         return build_result(e);
     }
 
