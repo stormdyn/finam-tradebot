@@ -5,7 +5,7 @@
 #include <thread>
 #include <vector>
 #include <grpcpp/grpcpp.h>
-#include "core/types.hpp"
+#include "core/interfaces.hpp"
 
 namespace finam::auth {
 
@@ -21,18 +21,15 @@ public:
     explicit TokenManager(Config cfg);
     ~TokenManager();
 
-    // Обязательно вызвать перед использованием:
-    // - Auth(secret) → JWT
-    // - TokenDetails(jwt) → account_ids
-    // - запускает SubscribeJwtRenewal фоновый стрим
+    // Auth(secret) → JWT, TokenDetails → account_ids,
+    // запуск фонового SubscribeJwtRenewal стрима
     Result<void> init(std::string_view secret);
 
     // Текущий JWT (атомарно, lock-free)
-    [[nodiscard]] std::string jwt() const noexcept;
-
-    [[nodiscard]] std::shared_ptr<grpc::Channel>      channel()          const noexcept;
-    [[nodiscard]] const std::vector<std::string>&     account_ids()      const noexcept;
-    [[nodiscard]] std::string_view                    primary_account_id() const;
+    [[nodiscard]] std::string                    jwt()                const noexcept;
+    [[nodiscard]] std::shared_ptr<grpc::Channel> channel()            const noexcept;
+    [[nodiscard]] const std::vector<std::string>& account_ids()       const noexcept;
+    [[nodiscard]] std::string_view               primary_account_id() const;
 
     void shutdown() noexcept;
 
