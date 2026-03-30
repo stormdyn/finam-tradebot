@@ -1,6 +1,5 @@
 CompileFlags:
   Add:
-    - "-DSPDLOG_FMT_EXTERNAL"
     - "-Wno-error"
 
 Diagnostics:

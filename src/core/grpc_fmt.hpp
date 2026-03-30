@@ -1,7 +1,7 @@
 #pragma once
-// Форматтеры для gRPC-типов, несовместимых с fmt out-of-the-box.
-// Включать ПЕРЕД <spdlog/spdlog.h> во всех .cpp, которые логируют gRPC-статусы.
-#include <fmt/format.h>
+// Форматтеры для gRPC-типов для spdlog bundled fmt.
+// Включать ПЕРЕД <spdlog/spdlog.h> во всех .cpp где логируются gRPC-статусы.
+#include <spdlog/fmt/fmt.h>
 #include <grpcpp/support/status_code_enum.h>
 
 template <>

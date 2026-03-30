@@ -12,11 +12,10 @@ list(APPEND CMAKE_PREFIX_PATH "${CMAKE_BINARY_DIR}")
 find_package(gRPC          REQUIRED)   # системный /usr
 find_package(Protobuf      REQUIRED)   # системный /usr
 find_package(spdlog        REQUIRED)   # Conan
-find_package(fmt           REQUIRED)   # Conan — явный fmt для SPDLOG_FMT_EXTERNAL
 find_package(nlohmann_json REQUIRED)   # Conan
 
-# spdlog использует внешний fmt (Conan fmt/11.1.4), clangd тоже
-add_compile_definitions(SPDLOG_FMT_EXTERNAL)
+# spdlog использует свой bundled fmt — НЕ устанавливаем SPDLOG_FMT_EXTERNAL,
+# чтобы избежать конфликта с системным /usr/include/fmt (v12 на Arch)
 
 # ── Warnings target ───────────────────────────────────────────────────────────
 add_library(project_warnings INTERFACE)

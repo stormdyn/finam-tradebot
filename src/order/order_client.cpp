@@ -1,13 +1,11 @@
 #include "order_client.hpp"
-#include "core/grpc_fmt.hpp"       // fmt::formatter<grpc::StatusCode> — ПЕРЕД spdlog
+#include "core/grpc_fmt.hpp"       // ПЕРЕД spdlog!
 #include <spdlog/spdlog.h>
 #include "grpc/tradeapi/v1/orders/orders_service.grpc.pb.h"
 
 namespace proto_orders = ::grpc::tradeapi::v1::orders;
 
 namespace finam::order {
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 namespace {
 
@@ -22,14 +20,12 @@ std::optional<Error> validate(const OrderRequest& req) {
     return std::nullopt;
 }
 
-// google.type.Decimal передаётся как строка
 void set_decimal(google::type::Decimal* d, double v) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%.10g", v);
     d->set_value(buf);
 }
 
-// proto OrderStatus → наш OrderStatus
 OrderStatus map_status(proto_orders::OrderStatus s) {
     using PS = proto_orders::OrderStatus;
     switch (s) {
@@ -146,7 +142,7 @@ Result<void> OrderClient::cancel(int64_t order_no, std::string_view client_id) {
     spdlog::info("[Order] cancel order_no={} client_id={}", order_no, client_id);
 
     proto_orders::CancelOrderRequest req;
-    req.set_account_id(account_id_);                  // fix: было client_id
+    req.set_account_id(account_id_);   // fix: используем член класса, не параметр
     req.set_order_id(std::to_string(order_no));
 
     proto_orders::OrderState resp;
@@ -210,8 +206,6 @@ void OrderClient::upsert(OrderState state) {
 }
 
 // ── run_order_stream ──────────────────────────────────────────────────────────
-// SubscribeOrders — стрим входящих обновлений заявок.
-// Stream TTL 86400s — штатный reconnect раз в сутки.
 
 void OrderClient::run_order_stream() {
     spdlog::info("[Order] order stream started account={}", account_id_);
