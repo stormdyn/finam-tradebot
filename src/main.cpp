@@ -9,7 +9,7 @@
 #include "order/order_client.hpp"
 #include "strategy/strategy_runner.hpp"
 
-// ── Graceful shutdown ─────────────────────────────────────────────────────────
+// ── Graceful shutdown ────────────────────────────────────────────────────────────
 static std::atomic<bool> g_shutdown{false};
 
 static void signal_handler(int) noexcept {
@@ -21,34 +21,35 @@ int main() {
     spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] [%t] %v");
     spdlog::info("finam-tradebot starting");
 
-    // ── Signals ───────────────────────────────────────────────────────────────
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    // ── Env ───────────────────────────────────────────────────────────────────
-    const char* secret = std::getenv("FINAM_SECRET_TOKEN");
-    if (!secret) {
+    // ── Env ───────────────────────────────────────────────────────────────────────────
+    const char* secret_env = std::getenv("FINAM_SECRET_TOKEN");
+    if (!secret_env) {
         spdlog::critical("FINAM_SECRET_TOKEN not set");
         return 1;
     }
+    const std::string_view secret{secret_env};
 
-    // ── Auth ──────────────────────────────────────────────────────────────────
+    // ── Auth ────────────────────────────────────────────────────────────────────────
     auto token_mgr = std::make_shared<finam::auth::TokenManager>(
-        finam::auth::Config{
+        finam::auth::TokenManagerConfig{
             .endpoint = "api.finam.ru:443",
-            .secret   = secret,
+            .use_tls  = true,
         }
     );
-    if (auto r = token_mgr->init(); !r) {
+    // secret передаётся в init(), не хранится в Config
+    if (auto r = token_mgr->init(secret); !r) {
         spdlog::critical("Auth failed: {}", r.error().message);
         return 1;
     }
     spdlog::info("Authenticated, account: {}", token_mgr->primary_account_id());
 
-    // ── Market data ───────────────────────────────────────────────────────────
+    // ── Market data ─────────────────────────────────────────────────────────────
     auto md = std::make_shared<finam::market_data::MarketDataClient>(token_mgr);
 
-    // ── Order executor ────────────────────────────────────────────────────────
+    // ── Order executor ────────────────────────────────────────────────────────────
     const std::string account_id{token_mgr->primary_account_id()};
 
     auto order_client = std::make_shared<finam::order::OrderClient>(
@@ -63,7 +64,7 @@ int main() {
         }
     );
 
-    // ── Strategy ──────────────────────────────────────────────────────────────
+    // ── Strategy ───────────────────────────────────────────────────────────────────
     finam::strategy::StrategyRunner::Config runner_cfg{
         .strategy = finam::strategy::ConfluenceStrategy::Config{
             .symbol    = finam::Symbol{"Si-6.26", "FORTS"},
@@ -71,30 +72,25 @@ int main() {
             .sl_ticks  = 30.0,
             .tp_ticks  = 90.0,
             .tick_size = 1.0,
-            // ob_cfg, tfi_cfg, spoof_cfg, session_cfg — defaults достаточно
         },
         .history_days  = 20,
         .poll_interval = std::chrono::microseconds{100},
     };
 
     auto runner = std::make_unique<finam::strategy::StrategyRunner>(
-        runner_cfg,
-        md,
-        order_client,
-        token_mgr
+        runner_cfg, md, order_client, token_mgr
     );
 
     spdlog::info("Strategy running, press Ctrl+C to stop");
 
-    // ── Main loop ─────────────────────────────────────────────────────────────
-    while (!g_shutdown.load(std::memory_order_acquire)) {
+    // ── Main loop ───────────────────────────────────────────────────────────────────
+    while (!g_shutdown.load(std::memory_order_acquire))
         std::this_thread::sleep_for(std::chrono::seconds{1});
-    }
 
-    // ── Graceful shutdown ─────────────────────────────────────────────────────
+    // ── Graceful shutdown ───────────────────────────────────────────────────────────
     spdlog::info("Shutting down...");
-    runner.reset();          // join strategy_thread, cancel subscriptions
-    token_mgr->shutdown();   // stop JWT renewal thread
+    runner.reset();
+    token_mgr->shutdown();
     spdlog::info("finam-tradebot stopped");
     return 0;
 }
