@@ -101,28 +101,30 @@ Result<int32_t> OrderClient::submit(const OrderRequest& req) {
     //     return std::unexpected(Error{ErrorCode::RpcError, status.error_message()});
     //
     // upsert(OrderState{
-    //     .order_id  = resp.order_id(),
-    //     .local_id  = local_id,
-    //     .symbol    = req.symbol,
-    //     .side      = req.side,
-    //     .status    = OrderStatus::Pending,
-    //     .type      = req.type,
-    //     .price     = req.price,
-    //     .qty_total = req.quantity,
-    //     .ts        = std::chrono::system_clock::now(),
+    //     .order_id     = resp.order_id(),
+    //     .local_id     = local_id,
+    //     .symbol       = req.symbol,
+    //     .side         = req.side,
+    //     .status       = OrderStatus::Pending,
+    //     .type         = req.type,
+    //     .price        = req.price,
+    //     .qty_total    = req.quantity,
+    //     .reject_reason = {},
+    //     .ts           = std::chrono::system_clock::now(),
     // });
 
     // Stub: сохраняем в трекер как Pending
     upsert(OrderState{
-        .order_id  = "stub-" + std::to_string(local_id),
-        .local_id  = local_id,
-        .symbol    = req.symbol,
-        .side      = req.side,
-        .status    = OrderStatus::Pending,
-        .type      = req.type,
-        .price     = req.price,
-        .qty_total = req.quantity,
-        .ts        = std::chrono::system_clock::now(),
+        .order_id      = "stub-" + std::to_string(local_id),
+        .local_id      = local_id,
+        .symbol        = req.symbol,
+        .side          = req.side,
+        .status        = OrderStatus::Pending,
+        .type          = req.type,
+        .price         = req.price,
+        .qty_total     = req.quantity,
+        .reject_reason = {},
+        .ts            = std::chrono::system_clock::now(),
     });
 
     return local_id;
@@ -187,18 +189,18 @@ void OrderClient::upsert(OrderState state) {
 
     // Конвертируем в OrderUpdate для колбэка
     OrderUpdate upd{
-        .order_no      = 0,
+        .order_no       = 0,
         .transaction_id = local_id,
-        .symbol        = state.symbol,
-        .client_id     = account_id_,
-        .side          = state.side,
-        .status        = state.status,
-        .type          = state.type,
-        .price         = state.price,
-        .qty_total     = state.qty_total,
-        .qty_filled    = state.qty_filled,
-        .message       = state.reject_reason,
-        .ts            = state.ts,
+        .symbol         = state.symbol,
+        .client_id      = account_id_,
+        .side           = state.side,
+        .status         = state.status,
+        .type           = state.type,
+        .price          = state.price,
+        .qty_total      = state.qty_total,
+        .qty_filled     = state.qty_filled,
+        .message        = state.reject_reason,
+        .ts             = state.ts,
     };
 
     {

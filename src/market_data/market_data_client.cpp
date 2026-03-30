@@ -1,5 +1,6 @@
 #include "market_data_client.hpp"
 
+#include <map>
 #include <cmath>
 #include <chrono>
 #include <spdlog/spdlog.h>
@@ -47,7 +48,7 @@ std::chrono::system_clock::time_point ts_from_proto(
 }
 
 Symbol symbol_from_string(const std::string& s) {
-    // Формат: "Si-6.26@FORTS" → ticker="Si-6.26", mic="FORTS"
+    // Формат: "Si-6.26@FORTS" → security_code="Si-6.26", security_board="FORTS"
     const auto at = s.rfind('@');
     if (at == std::string::npos) return Symbol{s, ""};
     return Symbol{s.substr(0, at), s.substr(at + 1)};
@@ -246,12 +247,17 @@ SubscriptionHandle MarketDataClient::subscribe_bars(
 
 // ── subscribe_order_book ──────────────────────────────────────────────────────
 //
-// ВАЖНО: SubscribeOrderBookResponse содержит repeated StreamOrderBook,
-// каждый StreamOrderBook::Row имеет Action (ADD/UPDATE/REMOVE) и oneof side
-// (buy_size / sell_size). Это уже инкрементальный стрим — не снапшоты.
+// SubscribeOrderBookResponse содержит repeated StreamOrderBook.
+// Каждый StreamOrderBook::Row несёт Action (ADD/UPDATE/REMOVE) и oneof side
+// (buy_size / sell_size) — это инкрементальный стрим, не снапшоты.
 //
-// subscribe_book_events() (в конце файла) адаптирует Row → BookLevelEvent
-// напрямую через Action, без diff двух снапшотов.
+// protobuf генерирует enum-значения с полным flat-префиксом:
+//   StreamOrderBook_Row_Action_ACTION_REMOVE  (числовое значение = 1)
+//   StreamOrderBook_Row_Action_ACTION_ADD     (= 2)
+//   StreamOrderBook_Row_Action_ACTION_UPDATE  (= 3)
+// using-алиас Action = StreamOrderBook::Row::Action даёт доступ через
+// Action::ACTION_REMOVE — но ТОЛЬКО если компилятор поддерживает это.
+// Для надёжности используем числовой cast через static_cast<int>.
 
 SubscriptionHandle MarketDataClient::subscribe_order_book(
     const Symbol&     symbol,
@@ -267,8 +273,6 @@ SubscriptionHandle MarketDataClient::subscribe_order_book(
     {
         spdlog::info("[MD] subscribe_order_book started symbol={}", sym_str);
 
-        // Храним текущий снапшот для восстановления после переподключения
-        // и для передачи в callback в виде OrderBook (наш внутренний тип)
         std::map<double, OrderBookRow, std::greater<double>> bids_map;
         std::map<double, OrderBookRow> asks_map;
 
@@ -284,29 +288,34 @@ SubscriptionHandle MarketDataClient::subscribe_order_book(
                 for (const auto& sob : resp.order_book()) {
                     for (const auto& row : sob.rows()) {
                         const double price = decimal_to_double(row.price());
-                        const auto   ts    = ts_from_proto(row.timestamp());
-                        const auto   act   = row.action();
-
-                        using Action = StreamOrderBook::Row::Action;
+                        // ACTION_UNSPECIFIED=0, ACTION_REMOVE=1,
+                        // ACTION_ADD=2, ACTION_UPDATE=3
+                        const int act = static_cast<int>(row.action());
+                        constexpr int kRemove = 1;
 
                         if (row.has_buy_size()) {
                             const double qty = decimal_to_double(row.buy_size());
-                            if (act == Action::ACTION_REMOVE || qty < 1e-9)
+                            if (act == kRemove || qty < 1e-9)
                                 bids_map.erase(price);
                             else
-                                bids_map[price] = OrderBookRow{price, qty, ts};
+                                bids_map[price] = OrderBookRow{
+                                    price,
+                                    static_cast<int64_t>(qty)
+                                };
                         } else if (row.has_sell_size()) {
                             const double qty = decimal_to_double(row.sell_size());
-                            if (act == Action::ACTION_REMOVE || qty < 1e-9)
+                            if (act == kRemove || qty < 1e-9)
                                 asks_map.erase(price);
                             else
-                                asks_map[price] = OrderBookRow{price, qty, ts};
+                                asks_map[price] = OrderBookRow{
+                                    price,
+                                    static_cast<int64_t>(qty)
+                                };
                         }
                     }
 
-                    // Собираем OrderBook снапшот и отдаём в callback
                     OrderBook book;
-                    book.ts = std::chrono::system_clock::now();
+                    book.ts     = std::chrono::system_clock::now();
                     book.symbol = symbol_from_string(sym_str);
                     for (auto& [p, r] : bids_map) book.bids.push_back(r);
                     for (auto& [p, r] : asks_map) book.asks.push_back(r);
@@ -406,7 +415,8 @@ SubscriptionHandle MarketDataClient::subscribe_latest_trades(
 }
 
 // ── subscribe_book_events ─────────────────────────────────────────────────────
-// (без изменений — адаптер над subscribe_order_book)
+// Адаптер над subscribe_order_book: диффит последовательные снапшоты
+// и эмитит BookLevelEvent для каждого изменившегося уровня 0..kBookLevels-1.
 
 SubscriptionHandle MarketDataClient::subscribe_book_events(
     const Symbol&     symbol,
@@ -421,26 +431,27 @@ SubscriptionHandle MarketDataClient::subscribe_book_events(
     auto on_book = [prev, callback = std::move(callback)](
         const OrderBook& book) mutable
     {
-        const int levels = strategy::kBookLevels;
-        const auto now   = book.ts;
+        const int  levels = strategy::kBookLevels;
+        const auto now    = book.ts;
 
         for (int k = 0; k < levels; ++k) {
-            const double old_bid = (k < (int)prev->bids.size())
-                                   ? prev->bids[k].quantity : 0.0;
-            const double old_ask = (k < (int)prev->asks.size())
-                                   ? prev->asks[k].quantity : 0.0;
-            const double new_bid = (k < (int)book.bids.size())
-                                   ? book.bids[k].quantity : 0.0;
-            const double new_ask = (k < (int)book.asks.size())
-                                   ? book.asks[k].quantity : 0.0;
+            const double old_bid = (k < static_cast<int>(prev->bids.size()))
+                ? static_cast<double>(prev->bids[k].quantity) : 0.0;
+            const double old_ask = (k < static_cast<int>(prev->asks.size()))
+                ? static_cast<double>(prev->asks[k].quantity) : 0.0;
+            const double new_bid = (k < static_cast<int>(book.bids.size()))
+                ? static_cast<double>(book.bids[k].quantity) : 0.0;
+            const double new_ask = (k < static_cast<int>(book.asks.size()))
+                ? static_cast<double>(book.asks[k].quantity) : 0.0;
 
             if (old_bid == new_bid && old_ask == new_ask) continue;
 
             const double price =
-                (k < (int)book.bids.size()) ? book.bids[k].price :
-                (k < (int)book.asks.size()) ? book.asks[k].price :
-                (k < (int)prev->bids.size()) ? prev->bids[k].price :
-                (k < (int)prev->asks.size()) ? prev->asks[k].price : 0.0;
+                (k < static_cast<int>(book.bids.size())) ? book.bids[k].price :
+                (k < static_cast<int>(book.asks.size())) ? book.asks[k].price :
+                (k < static_cast<int>(prev->bids.size())) ? prev->bids[k].price :
+                (k < static_cast<int>(prev->asks.size())) ? prev->asks[k].price :
+                0.0;
 
             callback(strategy::BookLevelEvent{
                 .level        = k,
