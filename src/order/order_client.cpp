@@ -1,8 +1,8 @@
 #include "order_client.hpp"
+#include "core/grpc_fmt.hpp"       // fmt::formatter<grpc::StatusCode> — ПЕРЕД spdlog
 #include <spdlog/spdlog.h>
 #include "grpc/tradeapi/v1/orders/orders_service.grpc.pb.h"
 
-// Псевдонимы для читаемости
 namespace proto_orders = ::grpc::tradeapi::v1::orders;
 
 namespace finam::order {
@@ -22,9 +22,8 @@ std::optional<Error> validate(const OrderRequest& req) {
     return std::nullopt;
 }
 
-// google.type.Decimal передаётся как строка в поле .value()
+// google.type.Decimal передаётся как строка
 void set_decimal(google::type::Decimal* d, double v) {
-    // Убираем trailing zeros через stringstream
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%.10g", v);
     d->set_value(buf);
@@ -96,7 +95,6 @@ Result<int32_t> OrderClient::submit(const OrderRequest& req) {
         req.type == OrderType::Market ? "MARKET" : "LIMIT",
         req.quantity, req.price);
 
-    // Собираем proto::Order
     proto_orders::Order grpc_req;
     grpc_req.set_account_id(account_id_);
     grpc_req.set_symbol(sym);
@@ -120,7 +118,7 @@ Result<int32_t> OrderClient::submit(const OrderRequest& req) {
     const auto status = orders_stub_->PlaceOrder(ctx.get(), grpc_req, &resp);
 
     if (!status.ok()) {
-        spdlog::error("[Order] PlaceOrder failed: {} {}",
+        spdlog::error("[Order] PlaceOrder failed: code={} msg={}",
             status.error_code(), status.error_message());
         return std::unexpected(Error{ErrorCode::RpcError, status.error_message()});
     }
@@ -148,7 +146,7 @@ Result<void> OrderClient::cancel(int64_t order_no, std::string_view client_id) {
     spdlog::info("[Order] cancel order_no={} client_id={}", order_no, client_id);
 
     proto_orders::CancelOrderRequest req;
-    req.set_account_id(std::string(client_id));
+    req.set_account_id(account_id_);                  // fix: было client_id
     req.set_order_id(std::to_string(order_no));
 
     proto_orders::OrderState resp;
@@ -156,7 +154,8 @@ Result<void> OrderClient::cancel(int64_t order_no, std::string_view client_id) {
     const auto status = orders_stub_->CancelOrder(ctx.get(), req, &resp);
 
     if (!status.ok()) {
-        spdlog::error("[Order] CancelOrder failed: {}", status.error_message());
+        spdlog::error("[Order] CancelOrder failed: code={} msg={}",
+            status.error_code(), status.error_message());
         return std::unexpected(Error{ErrorCode::RpcError, status.error_message()});
     }
     return {};
@@ -211,7 +210,6 @@ void OrderClient::upsert(OrderState state) {
 }
 
 // ── run_order_stream ──────────────────────────────────────────────────────────
-//
 // SubscribeOrders — стрим входящих обновлений заявок.
 // Stream TTL 86400s — штатный reconnect раз в сутки.
 
@@ -229,12 +227,10 @@ void OrderClient::run_order_stream() {
         proto_orders::SubscribeOrdersResponse resp;
         while (!stop_.load(std::memory_order_acquire) && stream->Read(&resp)) {
             for (const auto& o : resp.orders()) {
-                // Ищем local_id по client_order_id
                 int32_t local_id = 0;
                 try { local_id = std::stoi(o.order().client_order_id()); }
                 catch (...) {}
 
-                // qty_filled из executed_quantity
                 int32_t filled = 0;
                 try {
                     filled = static_cast<int32_t>(
@@ -244,7 +240,7 @@ void OrderClient::run_order_stream() {
                 upsert(OrderState{
                     .order_id      = o.order_id(),
                     .local_id      = local_id,
-                    .symbol        = {},   // symbol из o.order().symbol() если нужен
+                    .symbol        = {},
                     .side          = o.order().side() == ::grpc::tradeapi::v1::SIDE_BUY
                                      ? OrderSide::Buy : OrderSide::Sell,
                     .status        = map_status(o.status()),
@@ -263,8 +259,8 @@ void OrderClient::run_order_stream() {
         if (stop_.load(std::memory_order_acquire)) break;
 
         const auto st = stream->Finish();
-        spdlog::warn("[Order] stream ended: {} — reconnect in 5s",
-            st.error_message());
+        spdlog::warn("[Order] stream ended: code={} msg={} — reconnect in 5s",
+            st.error_code(), st.error_message());
         std::this_thread::sleep_for(std::chrono::seconds{5});
     }
 

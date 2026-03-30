@@ -4,6 +4,8 @@
 #include <expected>
 #include <chrono>
 #include <cstdint>
+#include <vector>
+
 namespace finam {
 
 // ── Ошибки ────────────────────────────────────────────────────────────────────
@@ -44,11 +46,14 @@ using Result = std::expected<T, Error>;
 
 using Timestamp = std::chrono::system_clock::time_point;
 
-// Идентификатор инструмента — именно так в API v2
+// Идентификатор инструмента: формат API v2 — "{TICKER}-{MM}.{YY}@{MIC}"
+// Пример: Si-6.26@FORTS, RTS-6.26@FORTS
+// security_code = "Si-6.26", security_board = "FORTS"
 struct Symbol {
-    std::string security_code;   // "Si", "RTS", "GOLD"
-    std::string security_board;  // "FUT" для FORTS фьючерсов
+    std::string security_code;   // "Si-6.26", "RTS-6.26", "GOLD-6.26"
+    std::string security_board;  // "FORTS" для срочного рынка MOEX
 
+    // Возвращает строку в формате API: "Si-6.26@FORTS"
     [[nodiscard]] std::string to_string() const {
         return security_code + "@" + security_board;
     }
@@ -79,10 +84,10 @@ struct OrderBookRow {
 };
 
 struct OrderBook {
-    Symbol                   symbol;
+    Symbol                    symbol;
     std::vector<OrderBookRow> asks;  // по возрастанию цены
     std::vector<OrderBookRow> bids;  // по убыванию цены
-    Timestamp                ts;
+    Timestamp                 ts;
 };
 
 // ── Ордера ────────────────────────────────────────────────────────────────────
@@ -92,8 +97,8 @@ enum class OrderStatus { Pending, PartialFill, Filled, Cancelled, Rejected };
 enum class OrderType   { Market, Limit };
 
 struct OrderUpdate {
-    int64_t     order_no{};       // биржевой номер (появляется после попадания в стакан)
-    int32_t     transaction_id{}; // наш ID транзакции
+    int64_t     order_no{};       // биржевой номер
+    int32_t     transaction_id{}; // наш локальный ID
     Symbol      symbol;
     std::string client_id;        // торговый счёт
     OrderSide   side{};
@@ -116,13 +121,13 @@ struct Signal {
     OrderType   order_type{OrderType::Market};
     double      price{};      // игнорируется при Market
     int32_t     quantity{};
-    std::string reason;       // для логов, не для API
+    std::string reason;       // для логов
 };
 
 // ── Запрос на выставление ордера ──────────────────────────────────────────────
 
 struct OrderRequest {
-    std::string client_id;    // торговый счёт из GetAccounts
+    std::string client_id;    // торговый счёт
     Symbol      symbol;
     OrderSide   side{};
     OrderType   type{OrderType::Market};
@@ -136,9 +141,9 @@ class IStrategy {
 public:
     virtual ~IStrategy() = default;
 
-    virtual Signal on_bar(const Bar& bar)                    = 0;
-    virtual Signal on_quote(const Quote& quote)              = 0;
-    virtual void   on_order_update(const OrderUpdate& upd)   = 0;
+    virtual Signal on_bar(const Bar& bar)                  = 0;
+    virtual Signal on_quote(const Quote& quote)            = 0;
+    virtual void   on_order_update(const OrderUpdate& upd) = 0;
 
     [[nodiscard]] virtual std::string_view name() const noexcept = 0;
 };
@@ -148,9 +153,9 @@ public:
     virtual ~IOrderExecutor() = default;
 
     // Возвращает transaction_id
-    virtual Result<int32_t> submit(const OrderRequest& req)      = 0;
+    virtual Result<int32_t> submit(const OrderRequest& req)    = 0;
     virtual Result<void>    cancel(int64_t order_no,
-                                   std::string_view client_id)   = 0;
+                                   std::string_view client_id) = 0;
 };
 
 class IRiskManager {

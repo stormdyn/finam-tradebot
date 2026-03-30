@@ -1,4 +1,6 @@
 #pragma once
+// Форматтеры для gRPC-типов, несовместимых с fmt out-of-the-box.
+// Включать ПЕРЕД <spdlog/spdlog.h> во всех .cpp, которые логируют gRPC-статусы.
 #include <fmt/format.h>
 #include <grpcpp/support/status_code_enum.h>
 

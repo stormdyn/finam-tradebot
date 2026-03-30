@@ -1,6 +1,6 @@
 #include "token_manager.hpp"
 #include <stdexcept>
-#include "core/grpc_fmt.hpp"  // перед spdlog
+#include "core/grpc_fmt.hpp"       // fmt::formatter<grpc::StatusCode> — ПЕРЕД spdlog
 #include <spdlog/spdlog.h>
 #include "grpc/tradeapi/v1/auth/auth_service.grpc.pb.h"
 
@@ -38,7 +38,7 @@ Result<void> TokenManager::init(std::string_view secret) {
     const auto status = stub.Auth(&ctx, req, &resp);
     if (!status.ok()) {
         spdlog::error("[Auth] Auth() failed: code={} msg={}",
-            static_cast<int>(status.error_code()), status.error_message());
+            status.error_code(), status.error_message());
         return std::unexpected(Error{ErrorCode::RpcError, status.error_message()});
     }
     store_jwt(resp.token());
@@ -54,7 +54,7 @@ Result<void> TokenManager::init(std::string_view secret) {
     const auto det_status = stub.TokenDetails(&det_ctx, det_req, &det_resp);
     if (!det_status.ok()) {
         spdlog::error("[Auth] TokenDetails() failed: code={} msg={}",
-            static_cast<int>(det_status.error_code()), det_status.error_message());
+            det_status.error_code(), det_status.error_message());
         return std::unexpected(Error{ErrorCode::RpcError, det_status.error_message()});
     }
     for (const auto& id : det_resp.account_ids())
@@ -130,7 +130,7 @@ void TokenManager::run_renewal_stream(std::string secret) {
 
         const auto st = stream->Finish();
         spdlog::warn("[Auth] renewal stream ended: code={} msg={} — reconnect in 5s",
-            static_cast<int>(st.error_code()), st.error_message());
+            st.error_code(), st.error_message());
         std::this_thread::sleep_for(std::chrono::seconds{5});
     }
 

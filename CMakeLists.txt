@@ -5,16 +5,17 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Conan toolchain подключается через -DCMAKE_TOOLCHAIN_FILE
+# Conan toolchain подключается через -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake
 list(APPEND CMAKE_PREFIX_PATH "${CMAKE_BINARY_DIR}")
 
 # ── Зависимости ───────────────────────────────────────────────────────────────
-find_package(gRPC      REQUIRED)   # системный /usr
-find_package(Protobuf  REQUIRED)   # системный /usr
-find_package(spdlog    REQUIRED)   # Conan
-find_package(nlohmann_json REQUIRED) # Conan
+find_package(gRPC          REQUIRED)   # системный /usr
+find_package(Protobuf      REQUIRED)   # системный /usr
+find_package(spdlog        REQUIRED)   # Conan
+find_package(fmt           REQUIRED)   # Conan — явный fmt для SPDLOG_FMT_EXTERNAL
+find_package(nlohmann_json REQUIRED)   # Conan
 
-# clangd и компилятор используют одинаковый fmt
+# spdlog использует внешний fmt (Conan fmt/11.1.4), clangd тоже
 add_compile_definitions(SPDLOG_FMT_EXTERNAL)
 
 # ── Warnings target ───────────────────────────────────────────────────────────
