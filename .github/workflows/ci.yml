@@ -66,10 +66,17 @@ jobs:
       # ── clang-tidy ────────────────────────────────────────────────────────────
       - name: clang-tidy
         run: |
-          # .clang-tidy is the config for clang-tidy; .clangd is for the LSP server
-          find src -name '*.cpp' | xargs clang-tidy \
+          # Use clang-tidy-18 (ubuntu-24.04 default) with explicit C++23 standard.
+          # compile_commands.json already has -std=c++23 but clang-tidy may not
+          # pick up the stdlib headers without --extra-arg on some configurations.
+          # Filter only clang-diagnostic-error lines (not warnings) to fail the build.
+          TIDY=$(command -v clang-tidy-18 || command -v clang-tidy)
+          echo "Using: $TIDY"
+          find src -name '*.cpp' | xargs "$TIDY" \
             -p build \
             --config-file=.clang-tidy \
+            --extra-arg=-std=c++23 \
+            --extra-arg=-stdlib=libstdc++ \
             --warnings-as-errors='' \
             2>&1 | tee clang-tidy.log
           if grep -q 'error:' clang-tidy.log; then exit 1; fi
