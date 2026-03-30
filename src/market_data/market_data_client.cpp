@@ -5,12 +5,13 @@
 #include <chrono>
 #include <spdlog/spdlog.h>
 
+#include "core/backoff.hpp"
 #include "grpc/tradeapi/v1/marketdata/marketdata_service.grpc.pb.h"
 #include "grpc/tradeapi/v1/marketdata/marketdata_service.pb.h"
 
 namespace finam::market_data {
 
-// ── Decimal helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────────────
 
 namespace {
 
@@ -47,6 +48,14 @@ Symbol symbol_from_string(const std::string& s) {
     const auto at = s.rfind('@');
     if (at == std::string::npos) return Symbol{s, ""};
     return Symbol{s.substr(0, at), s.substr(at + 1)};
+}
+
+// Логируем reconnect единообразно
+void log_reconnect(std::string_view stream_name, int attempt,
+                   std::chrono::milliseconds delay) noexcept
+{
+    spdlog::warn("[MD] {} disconnected, reconnect #{} in {}ms",
+        stream_name, attempt, delay.count());
 }
 
 } // namespace
@@ -87,11 +96,10 @@ Result<std::vector<Bar>> MarketDataClient::get_bars(
     BarsRequest req;
     req.set_symbol(symbol.to_string());
     req.set_timeframe(timeframe_to_proto(timeframe));
-
-    const auto from_t = std::chrono::system_clock::to_time_t(from);
-    const auto to_t   = std::chrono::system_clock::to_time_t(to);
-    req.mutable_interval()->mutable_start_time()->set_seconds(from_t);
-    req.mutable_interval()->mutable_end_time()->set_seconds(to_t);
+    req.mutable_interval()->mutable_start_time()->set_seconds(
+        std::chrono::system_clock::to_time_t(from));
+    req.mutable_interval()->mutable_end_time()->set_seconds(
+        std::chrono::system_clock::to_time_t(to));
 
     auto ctx = make_context();
     BarsResponse resp;
@@ -102,13 +110,13 @@ Result<std::vector<Bar>> MarketDataClient::get_bars(
         return std::unexpected(Error{ErrorCode::RpcError, status.error_message()});
     }
 
-    const std::string tf_str{timeframe};  // сохраняем для простановки в Bar
+    const std::string tf_str{timeframe};
     std::vector<Bar> bars;
     bars.reserve(resp.bars_size());
     for (const auto& b : resp.bars()) {
         bars.push_back(Bar{
             .symbol    = symbol,
-            .timeframe = tf_str,   // ← фикс: "D1" или "M1"
+            .timeframe = tf_str,
             .open      = decimal_to_double(b.open()),
             .high      = decimal_to_double(b.high()),
             .low       = decimal_to_double(b.low()),
@@ -132,27 +140,23 @@ SubscriptionHandle MarketDataClient::subscribe_quotes(
 
     auto stop = std::make_shared<std::atomic<bool>>(false);
 
-    auto thread = std::thread([this,
-                               symbols  = std::move(symbols),
-                               callback = std::move(callback),
-                               stop]() mutable
+    auto thread = std::thread(
+        [this, symbols = std::move(symbols), callback = std::move(callback), stop]() mutable
     {
         spdlog::info("[MD] subscribe_quotes started ({} symbols)", symbols.size());
+        core::ExponentialBackoff bo;
 
         while (!stop->load(std::memory_order_acquire)) {
             auto ctx = make_context();
-
             SubscribeQuoteRequest req;
-            for (const auto& s : symbols)
-                req.add_symbols(s.to_string());
+            for (const auto& s : symbols) req.add_symbols(s.to_string());
 
             auto stream = stub_->SubscribeQuote(ctx.get(), req);
-
             SubscribeQuoteResponse resp;
+
             while (!stop->load() && stream->Read(&resp)) {
                 if (resp.has_error() && resp.error().code() != 0) {
-                    spdlog::warn("[MD] quote stream error: {}",
-                        resp.error().description());
+                    spdlog::warn("[MD] quote stream error: {}", resp.error().description());
                     break;
                 }
                 for (const auto& q : resp.quote()) {
@@ -165,15 +169,17 @@ SubscriptionHandle MarketDataClient::subscribe_quotes(
                         .ts     = ts_from_proto(q.timestamp()),
                     });
                 }
+                bo.reset();  // успешное чтение — сбрасываем backoff
             }
             stream->Finish();
 
             if (!stop->load()) {
-                spdlog::warn("[MD] subscribe_quotes reconnecting in 1s...");
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                const auto delay = core::ExponentialBackoff{}.wait(*stop)  // preview delay
+                    ? std::chrono::milliseconds{0} : std::chrono::milliseconds{0};
+                log_reconnect("subscribe_quotes", bo.attempt(), std::chrono::milliseconds{0});
+                if (!bo.wait(*stop)) break;  // stop сработал во время сна
             }
         }
-
         spdlog::info("[MD] subscribe_quotes stopped");
     });
 
@@ -192,32 +198,32 @@ SubscriptionHandle MarketDataClient::subscribe_bars(
 {
     using namespace ::grpc::tradeapi::v1::marketdata;
 
-    auto stop    = std::make_shared<std::atomic<bool>>(false);
+    auto stop   = std::make_shared<std::atomic<bool>>(false);
     auto sym_str = symbol.to_string();
-    auto tf_str  = std::string{timeframe};  // копия для ламбды
+    auto tf_str  = std::string{timeframe};
     auto tf      = timeframe_to_proto(timeframe);
 
-    auto thread = std::thread([this, sym_str, tf_str, tf,
-                               callback = std::move(callback), stop]() mutable
+    auto thread = std::thread(
+        [this, sym_str, tf_str, tf, callback = std::move(callback), stop]() mutable
     {
         spdlog::info("[MD] subscribe_bars started symbol={} tf={}", sym_str, tf_str);
+        const Symbol sym = symbol_from_string(sym_str);
+        core::ExponentialBackoff bo;
 
         while (!stop->load(std::memory_order_acquire)) {
             auto ctx = make_context();
-
             SubscribeBarsRequest req;
             req.set_symbol(sym_str);
             req.set_timeframe(tf);
 
             auto stream = stub_->SubscribeBars(ctx.get(), req);
-
             SubscribeBarsResponse resp;
-            const Symbol sym = symbol_from_string(sym_str);
+
             while (!stop->load() && stream->Read(&resp)) {
                 for (const auto& b : resp.bars()) {
                     callback(Bar{
                         .symbol    = sym,
-                        .timeframe = tf_str,   // ← фикс: "M1" или "D1"
+                        .timeframe = tf_str,
                         .open      = decimal_to_double(b.open()),
                         .high      = decimal_to_double(b.high()),
                         .low       = decimal_to_double(b.low()),
@@ -226,15 +232,15 @@ SubscriptionHandle MarketDataClient::subscribe_bars(
                         .ts        = ts_from_proto(b.timestamp()),
                     });
                 }
+                bo.reset();
             }
             stream->Finish();
 
             if (!stop->load()) {
-                spdlog::warn("[MD] subscribe_bars reconnecting in 1s...");
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                log_reconnect("subscribe_bars", bo.attempt(), std::chrono::milliseconds{0});
+                if (!bo.wait(*stop)) break;
             }
         }
-
         spdlog::info("[MD] subscribe_bars stopped");
     });
 
@@ -255,17 +261,16 @@ SubscriptionHandle MarketDataClient::subscribe_order_book(
     auto stop    = std::make_shared<std::atomic<bool>>(false);
     auto sym_str = symbol.to_string();
 
-    auto thread = std::thread([this, sym_str,
-                               callback = std::move(callback), stop]() mutable
+    auto thread = std::thread(
+        [this, sym_str, callback = std::move(callback), stop]() mutable
     {
         spdlog::info("[MD] subscribe_order_book started symbol={}", sym_str);
-
         std::map<double, OrderBookRow, std::greater<double>> bids_map;
-        std::map<double, OrderBookRow> asks_map;
+        std::map<double, OrderBookRow>                       asks_map;
+        core::ExponentialBackoff bo;
 
         while (!stop->load(std::memory_order_acquire)) {
             auto ctx = make_context();
-
             SubscribeOrderBookRequest req;
             req.set_symbol(sym_str);
             auto stream = stub_->SubscribeOrderBook(ctx.get(), req);
@@ -275,21 +280,17 @@ SubscriptionHandle MarketDataClient::subscribe_order_book(
                 for (const auto& sob : resp.order_book()) {
                     for (const auto& row : sob.rows()) {
                         const double price = decimal_to_double(row.price());
-                        const int act = static_cast<int>(row.action());
                         constexpr int kRemove = 1;
+                        const int act = static_cast<int>(row.action());
 
                         if (row.has_buy_size()) {
                             const double qty = decimal_to_double(row.buy_size());
-                            if (act == kRemove || qty < 1e-9)
-                                bids_map.erase(price);
-                            else
-                                bids_map[price] = OrderBookRow{price, static_cast<int64_t>(qty)};
+                            if (act == kRemove || qty < 1e-9) bids_map.erase(price);
+                            else bids_map[price] = OrderBookRow{price, static_cast<int64_t>(qty)};
                         } else if (row.has_sell_size()) {
                             const double qty = decimal_to_double(row.sell_size());
-                            if (act == kRemove || qty < 1e-9)
-                                asks_map.erase(price);
-                            else
-                                asks_map[price] = OrderBookRow{price, static_cast<int64_t>(qty)};
+                            if (act == kRemove || qty < 1e-9) asks_map.erase(price);
+                            else asks_map[price] = OrderBookRow{price, static_cast<int64_t>(qty)};
                         }
                     }
 
@@ -300,17 +301,17 @@ SubscriptionHandle MarketDataClient::subscribe_order_book(
                     for (auto& [p, r] : asks_map) book.asks.push_back(r);
                     callback(book);
                 }
+                bo.reset();
             }
             stream->Finish();
 
             if (!stop->load()) {
-                spdlog::warn("[MD] subscribe_order_book reconnecting in 1s...");
+                log_reconnect("subscribe_order_book", bo.attempt(), std::chrono::milliseconds{0});
                 bids_map.clear();
                 asks_map.clear();
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (!bo.wait(*stop)) break;
             }
         }
-
         spdlog::info("[MD] subscribe_order_book stopped");
     });
 
@@ -332,16 +333,15 @@ SubscriptionHandle MarketDataClient::subscribe_latest_trades(
     auto stop    = std::make_shared<std::atomic<bool>>(false);
     auto sym_str = symbol.to_string();
 
-    auto thread = std::thread([this, sym_str,
-                               callback = std::move(callback), stop]() mutable
+    auto thread = std::thread(
+        [this, sym_str, callback = std::move(callback), stop]() mutable
     {
         spdlog::info("[MD] subscribe_latest_trades started symbol={}", sym_str);
-
         double last_price = 0.0;
+        core::ExponentialBackoff bo;
 
         while (!stop->load(std::memory_order_acquire)) {
             auto ctx = make_context();
-
             SubscribeLatestTradesRequest req;
             req.set_symbol(sym_str);
             auto stream = stub_->SubscribeLatestTrades(ctx.get(), req);
@@ -353,13 +353,9 @@ SubscriptionHandle MarketDataClient::subscribe_latest_trades(
                     const double vol   = decimal_to_double(t.size());
 
                     bool is_buy;
-                    if (t.side() == Side::SIDE_BUY)
-                        is_buy = true;
-                    else if (t.side() == Side::SIDE_SELL)
-                        is_buy = false;
-                    else
-                        is_buy = (price >= last_price);  // tick rule fallback
-
+                    if      (t.side() == Side::SIDE_BUY)  is_buy = true;
+                    else if (t.side() == Side::SIDE_SELL) is_buy = false;
+                    else                                   is_buy = (price >= last_price);
                     last_price = price;
 
                     callback(strategy::TradeEvent{
@@ -369,15 +365,16 @@ SubscriptionHandle MarketDataClient::subscribe_latest_trades(
                         .ts     = ts_from_proto(t.timestamp()),
                     });
                 }
+                bo.reset();
             }
             stream->Finish();
 
             if (!stop->load()) {
-                spdlog::warn("[MD] subscribe_latest_trades reconnecting in 1s...");
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                log_reconnect("subscribe_latest_trades", bo.attempt(),
+                    std::chrono::milliseconds{0});
+                if (!bo.wait(*stop)) break;
             }
         }
-
         spdlog::info("[MD] subscribe_latest_trades stopped");
     });
 
@@ -418,8 +415,8 @@ SubscriptionHandle MarketDataClient::subscribe_book_events(
             if (old_bid == new_bid && old_ask == new_ask) continue;
 
             const double price =
-                (k < static_cast<int>(book.bids.size())) ? book.bids[k].price :
-                (k < static_cast<int>(book.asks.size())) ? book.asks[k].price :
+                (k < static_cast<int>(book.bids.size()))  ? book.bids[k].price  :
+                (k < static_cast<int>(book.asks.size()))  ? book.asks[k].price  :
                 (k < static_cast<int>(prev->bids.size())) ? prev->bids[k].price :
                 (k < static_cast<int>(prev->asks.size())) ? prev->asks[k].price :
                 0.0;
