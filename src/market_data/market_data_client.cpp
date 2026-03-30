@@ -50,12 +50,12 @@ Symbol symbol_from_string(const std::string& s) {
     return Symbol{s.substr(0, at), s.substr(at + 1)};
 }
 
-// Логируем reconnect единообразно
-void log_reconnect(std::string_view stream_name, int attempt,
-                   std::chrono::milliseconds delay) noexcept
-{
-    spdlog::warn("[MD] {} disconnected, reconnect #{} in {}ms",
-        stream_name, attempt, delay.count());
+// attempt — текущая попытка (0-based), задержка будет base*2^attempt
+void log_reconnect(std::string_view name, int attempt) noexcept {
+    const int delay_ms = static_cast<int>(
+        std::min(500.0 * (1 << std::min(attempt, 6)), 30000.0));
+    spdlog::warn("[MD] {} disconnected, reconnect #{} (~{}ms backoff)",
+        name, attempt + 1, delay_ms);
 }
 
 } // namespace
@@ -174,10 +174,8 @@ SubscriptionHandle MarketDataClient::subscribe_quotes(
             stream->Finish();
 
             if (!stop->load()) {
-                const auto delay = core::ExponentialBackoff{}.wait(*stop)  // preview delay
-                    ? std::chrono::milliseconds{0} : std::chrono::milliseconds{0};
-                log_reconnect("subscribe_quotes", bo.attempt(), std::chrono::milliseconds{0});
-                if (!bo.wait(*stop)) break;  // stop сработал во время сна
+                log_reconnect("subscribe_quotes", bo.attempt());
+                if (!bo.wait(*stop)) break;
             }
         }
         spdlog::info("[MD] subscribe_quotes stopped");
@@ -198,7 +196,7 @@ SubscriptionHandle MarketDataClient::subscribe_bars(
 {
     using namespace ::grpc::tradeapi::v1::marketdata;
 
-    auto stop   = std::make_shared<std::atomic<bool>>(false);
+    auto stop    = std::make_shared<std::atomic<bool>>(false);
     auto sym_str = symbol.to_string();
     auto tf_str  = std::string{timeframe};
     auto tf      = timeframe_to_proto(timeframe);
@@ -237,7 +235,7 @@ SubscriptionHandle MarketDataClient::subscribe_bars(
             stream->Finish();
 
             if (!stop->load()) {
-                log_reconnect("subscribe_bars", bo.attempt(), std::chrono::milliseconds{0});
+                log_reconnect("subscribe_bars", bo.attempt());
                 if (!bo.wait(*stop)) break;
             }
         }
@@ -306,7 +304,7 @@ SubscriptionHandle MarketDataClient::subscribe_order_book(
             stream->Finish();
 
             if (!stop->load()) {
-                log_reconnect("subscribe_order_book", bo.attempt(), std::chrono::milliseconds{0});
+                log_reconnect("subscribe_order_book", bo.attempt());
                 bids_map.clear();
                 asks_map.clear();
                 if (!bo.wait(*stop)) break;
@@ -370,8 +368,7 @@ SubscriptionHandle MarketDataClient::subscribe_latest_trades(
             stream->Finish();
 
             if (!stop->load()) {
-                log_reconnect("subscribe_latest_trades", bo.attempt(),
-                    std::chrono::milliseconds{0});
+                log_reconnect("subscribe_latest_trades", bo.attempt());
                 if (!bo.wait(*stop)) break;
             }
         }
