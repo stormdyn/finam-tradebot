@@ -5,6 +5,7 @@
 #include <spdlog/spdlog.h>
 
 #include "auth/token_manager.hpp"
+#include "core/contract.hpp"
 #include "market_data/market_data_client.hpp"
 #include "order/order_client.hpp"
 #include "risk/risk_manager.hpp"
@@ -18,11 +19,42 @@ static void signal_handler(int) noexcept {
     g_shutdown.store(true, std::memory_order_release);
 }
 
-int main() {
+// ── dry-run guard ────────────────────────────────────────────────────────────────────
+//
+// Обёртка IOrderExecutor, которая логирует ордера, но не отправляет их.
+// Используется в режиме --dry-run вместо OrderClient.
+
+class DryRunExecutor final : public finam::IOrderExecutor {
+public:
+    finam::Result<int32_t> submit(const finam::OrderRequest& req) override {
+        spdlog::info("[DryRun] SUBMIT symbol={} side={} type={} qty={} price={}",
+            req.symbol.to_string(),
+            req.side == finam::OrderSide::Buy ? "BUY" : "SELL",
+            req.type == finam::OrderType::Market ? "MARKET" : "LIMIT",
+            req.quantity, req.price);
+        return ++id_;
+    }
+
+    finam::Result<void> cancel(int64_t order_no, std::string_view) override {
+        spdlog::info("[DryRun] CANCEL order_no={}", order_no);
+        return {};
+    }
+
+private:
+    int32_t id_{0};
+};
+
+int main(int argc, char* argv[]) {
     spdlog::set_level(spdlog::level::debug);
     spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] [%t] %v");
-    spdlog::info("finam-tradebot starting");
 
+    // ── Разбор аргументов ────────────────────────────────────────────────────────────
+    bool dry_run = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view{argv[i]} == "--dry-run") dry_run = true;
+    }
+
+    spdlog::info("finam-tradebot starting{}", dry_run ? " [DRY-RUN]" : "");
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
 
@@ -47,6 +79,12 @@ int main() {
     const std::string account_id{token_mgr->primary_account_id()};
     spdlog::info("Authenticated, account: {}", account_id);
 
+    // ── Автовыбор символа ───────────────────────────────────────────────────────────
+    // nearest_contract("Si", rollover_days=5):
+    //   30 марта 2026, third_friday(2026,3)=20, cur_day(30)>=20-5=15 → Si-6.26@FORTS
+    const auto symbol = finam::core::nearest_contract("Si", 5);
+    spdlog::info("Active contract: {}", symbol.to_string());
+
     // ── Risk ───────────────────────────────────────────────────────────────────────
     auto risk = std::make_shared<finam::risk::RiskManager>(
         finam::risk::RiskConfig{
@@ -64,19 +102,23 @@ int main() {
     // ── Market data ─────────────────────────────────────────────────────────────
     auto md = std::make_shared<finam::market_data::MarketDataClient>(token_mgr);
 
-    // ── OrderClient ───────────────────────────────────────────────────────────────────
-    //
-    // Конструируем OrderClient без callback — подключим позже через StrategyRunner.
-    // Порядок важен: runner владеет стратегией и знает куда маршрутизировать on_order_update.
-    auto order_client = std::make_shared<finam::order::OrderClient>(
-        token_mgr, account_id
-        // callback передаётся позже через set_update_callback()
-    );
+    // ── Executor: dry-run или реальный ───────────────────────────────────────────────
+    std::shared_ptr<finam::IOrderExecutor> executor;
+    std::shared_ptr<finam::order::OrderClient> order_client;
+
+    if (dry_run) {
+        executor = std::make_shared<DryRunExecutor>();
+        spdlog::warn("[DryRun] orders will NOT be sent to exchange");
+    } else {
+        order_client = std::make_shared<finam::order::OrderClient>(
+            token_mgr, account_id);
+        executor = order_client;
+    }
 
     // ── StrategyRunner ─────────────────────────────────────────────────────────────
     finam::strategy::StrategyRunner::Config runner_cfg{
         .strategy = finam::strategy::ConfluenceStrategy::Config{
-            .symbol    = finam::Symbol{"Si-6.26", "FORTS"},
+            .symbol    = symbol,  // автовыбранный контракт
             .base_qty  = 1,
             .sl_ticks  = 30.0,
             .tp_ticks  = 90.0,
@@ -86,18 +128,16 @@ int main() {
         .poll_interval = std::chrono::microseconds{100},
     };
 
-    // Runner создаётся до set_update_callback — потому принимает order_client по IOrderExecutor.
-    // StrategyRunner сам регистрирует on_update_ через set_update_callback() в конструкторе.
     auto runner = std::make_unique<finam::strategy::StrategyRunner>(
-        runner_cfg, md, order_client, token_mgr, risk
+        runner_cfg, md, executor, token_mgr, risk
     );
 
-    // Теперь вызываем set_update_callback: runner уже готов, strategy_thread_ запущен.
-    // Коллбэк вызывается из order stream thread OrderClient —
-    // он доставляет событие в strategy thread через SPSC-очередь.
-    order_client->set_update_callback(runner->make_order_callback());
+    // Завязываем callback только если есть реальный OrderClient
+    if (order_client)
+        order_client->set_update_callback(runner->make_order_callback());
 
-    spdlog::info("Strategy running, press Ctrl+C to stop");
+    spdlog::info("Strategy running on {}, press Ctrl+C to stop",
+        symbol.to_string());
 
     // ── Main loop ───────────────────────────────────────────────────────────────────
     while (!g_shutdown.load(std::memory_order_acquire))
@@ -105,10 +145,10 @@ int main() {
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────────────
     spdlog::info("Shutting down...");
-    runner.reset();          // join strategy_thread_, cancel subscriptions
-    order_client->shutdown(); // join order stream
-    risk->shutdown();         // join poll_thread_
-    token_mgr->shutdown();    // join renewal_thread_
+    runner.reset();
+    if (order_client) order_client->shutdown();
+    risk->shutdown();
+    token_mgr->shutdown();
     spdlog::info("finam-tradebot stopped");
     return 0;
 }
