@@ -95,11 +95,11 @@ struct BacktestResult {
             !std::getline(ss,c,',')   || !std::getline(ss,v,',')) continue;
         try {
             bars.push_back(Bar{
-                .date      = date,
                 .timeframe = "D1",
                 .open  = std::stod(o), .high  = std::stod(h),
                 .low   = std::stod(l), .close = std::stod(c),
                 .volume = static_cast<int64_t>(std::stoll(v)),
+                .date  = date,
             });
         } catch (...) { continue; }
     }

@@ -282,7 +282,14 @@ private:
     }
 
     [[nodiscard]] static Signal no_signal() noexcept {
-        return Signal{.direction = Signal::Direction::None};
+        return Signal{
+            .symbol    = {},
+            .direction = Signal::Direction::None,
+            .order_type = OrderType::Market,
+            .price     = 0.0,
+            .quantity  = 0,
+            .reason    = {},
+        };
     }
 
     // ── State ───────────────────────────────────────────────────────────────────
