@@ -1,5 +1,7 @@
 #include "order_client.hpp"
-#include "core/grpc_fmt.hpp"       // ПЕРЕД spdlog!
+#include "core/grpc_fmt.hpp"
+#include "core/backoff.hpp"
+#include "core/maintenance.hpp"
 #include <spdlog/spdlog.h>
 #include "grpc/tradeapi/v1/orders/orders_service.grpc.pb.h"
 
@@ -43,7 +45,7 @@ OrderStatus map_status(proto_orders::OrderStatus s) {
 
 } // namespace
 
-// ── OrderClient ───────────────────────────────────────────────────────────────
+// ── OrderClient ───────────────────────────────────────────────────────────────────
 
 OrderClient::OrderClient(
     std::shared_ptr<auth::TokenManager> token_mgr,
@@ -76,7 +78,7 @@ int32_t OrderClient::next_id() noexcept {
     return id_counter_.fetch_add(1, std::memory_order_relaxed);
 }
 
-// ── submit ────────────────────────────────────────────────────────────────────
+// ── submit ───────────────────────────────────────────────────────────────────────
 
 Result<int32_t> OrderClient::submit(const OrderRequest& req) {
     if (auto err = validate(req))
@@ -136,13 +138,13 @@ Result<int32_t> OrderClient::submit(const OrderRequest& req) {
     return local_id;
 }
 
-// ── cancel ────────────────────────────────────────────────────────────────────
+// ── cancel ──────────────────────────────────────────────────────────────────────
 
 Result<void> OrderClient::cancel(int64_t order_no, std::string_view client_id) {
     spdlog::info("[Order] cancel order_no={} client_id={}", order_no, client_id);
 
     proto_orders::CancelOrderRequest req;
-    req.set_account_id(account_id_);   // fix: используем член класса, не параметр
+    req.set_account_id(account_id_);
     req.set_order_id(std::to_string(order_no));
 
     proto_orders::OrderState resp;
@@ -157,7 +159,7 @@ Result<void> OrderClient::cancel(int64_t order_no, std::string_view client_id) {
     return {};
 }
 
-// ── active_orders / find ──────────────────────────────────────────────────────
+// ── active_orders / find ──────────────────────────────────────────────────────────
 
 std::vector<OrderState> OrderClient::active_orders() const {
     std::shared_lock lock(orders_mu_);
@@ -177,14 +179,27 @@ std::optional<OrderState> OrderClient::find(int32_t local_id) const {
     return std::nullopt;
 }
 
-// ── upsert ────────────────────────────────────────────────────────────────────
+// ── upsert ─────────────────────────────────────────────────────────────────────────
+//
+// Вызывается как из submit(), так и из run_order_stream().
+// on_update_ — подписчик (StrategyRunner), который передаёт обновления
+// стратегии и RiskManager::on_fill().
 
 void OrderClient::upsert(OrderState state) {
-    const int32_t local_id = state.local_id;
+    const int32_t lid = state.local_id;
+
+    // Перед записью в кэш получаем предыдущее состояние для delta qty_filled
+    int32_t prev_filled = 0;
+    {
+        std::shared_lock rlock(orders_mu_);
+        if (auto it = orders_.find(lid); it != orders_.end())
+            prev_filled = it->second.qty_filled;
+    }
+    const int32_t delta_filled = state.qty_filled - prev_filled;
 
     OrderUpdate upd{
         .order_no       = 0,
-        .transaction_id = local_id,
+        .transaction_id = lid,
         .symbol         = state.symbol,
         .client_id      = account_id_,
         .side           = state.side,
@@ -192,30 +207,39 @@ void OrderClient::upsert(OrderState state) {
         .type           = state.type,
         .price          = state.price,
         .qty_total      = state.qty_total,
-        .qty_filled     = state.qty_filled,
+        .qty_filled     = delta_filled,   // дельта — сколько было исполнено в этот раз
         .message        = state.reject_reason,
         .ts             = state.ts,
     };
 
     {
         std::unique_lock lock(orders_mu_);
-        orders_[local_id] = std::move(state);
+        orders_[lid] = std::move(state);
     }
 
+    // on_update_ вызывается после разблокировки мьютекса, чтобы
+    // избежать deadlock если callback сам обращается к cancel()
     if (on_update_) on_update_(upd);
 }
 
-// ── run_order_stream ──────────────────────────────────────────────────────────
+// ── run_order_stream ──────────────────────────────────────────────────────────────
+//
+// Цикл: техобслуживание → connect → drain → backoff → повтор
+// Backoff: та же ExponentialBackoff что и в MD-стримах.
+// Окно техобслуживания: 05:00-06:15 MSK (ожидаем, не реконнектимся).
 
 void OrderClient::run_order_stream() {
     spdlog::info("[Order] order stream started account={}", account_id_);
+    core::ExponentialBackoff  bo;
+    core::MaintenanceWindow   maint;
 
     while (!stop_.load(std::memory_order_acquire)) {
-        auto ctx = make_context();
+        // Ожидаем окно ТО — не пытаемся подключиться пока биржа закрыта
+        if (!maint.wait_if_active(stop_)) break;
 
+        auto ctx = make_context();
         proto_orders::SubscribeOrdersRequest req;
         req.set_account_id(account_id_);
-
         auto stream = orders_stub_->SubscribeOrders(ctx.get(), req);
 
         proto_orders::SubscribeOrdersResponse resp;
@@ -225,37 +249,50 @@ void OrderClient::run_order_stream() {
                 try { local_id = std::stoi(o.order().client_order_id()); }
                 catch (...) {}
 
-                int32_t filled = 0;
+                int32_t qty_total = 0;
+                int32_t filled    = 0;
                 try {
+                    qty_total = static_cast<int32_t>(
+                        std::stod(o.initial_quantity().value()));
                     filled = static_cast<int32_t>(
                         std::stod(o.executed_quantity().value()));
                 } catch (...) {}
 
+                // Достраиваем symbol: если ордер есть в кэше — берём символ оттуда
+                Symbol sym;
+                {
+                    std::shared_lock rlock(orders_mu_);
+                    if (auto it = orders_.find(local_id); it != orders_.end())
+                        sym = it->second.symbol;
+                }
+
                 upsert(OrderState{
                     .order_id      = o.order_id(),
                     .local_id      = local_id,
-                    .symbol        = {},
+                    .symbol        = sym,
                     .side          = o.order().side() == ::grpc::tradeapi::v1::SIDE_BUY
                                      ? OrderSide::Buy : OrderSide::Sell,
                     .status        = map_status(o.status()),
                     .type          = o.order().type() == proto_orders::ORDER_TYPE_MARKET
                                      ? OrderType::Market : OrderType::Limit,
                     .price         = 0.0,
-                    .qty_total     = static_cast<int32_t>(
-                                     std::stod(o.initial_quantity().value())),
+                    .qty_total     = qty_total,
                     .qty_filled    = filled,
                     .reject_reason = {},
                     .ts            = std::chrono::system_clock::now(),
                 });
             }
+            bo.reset();  // успешное чтение — сбрасываем backoff
         }
+        stream->Finish();
 
         if (stop_.load(std::memory_order_acquire)) break;
 
-        const auto st = stream->Finish();
-        spdlog::warn("[Order] stream ended: code={} msg={} — reconnect in 5s",
-            st.error_code(), st.error_message());
-        std::this_thread::sleep_for(std::chrono::seconds{5});
+        // Техобслуживание — не backoff, просто ждём
+        if (maint.is_active()) continue;
+
+        spdlog::warn("[Order] stream ended, reconnect #{} with backoff", bo.attempt() + 1);
+        if (!bo.wait(stop_)) break;
     }
 
     spdlog::info("[Order] order stream stopped");
