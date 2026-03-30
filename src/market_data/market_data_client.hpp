@@ -7,6 +7,7 @@
 #include <vector>
 #include <grpcpp/grpcpp.h>
 
+#include "grpc/tradeapi/v1/marketdata/marketdata_service.grpc.pb.h"
 #include "core/interfaces.hpp"
 #include "auth/token_manager.hpp"
 #include "strategy/ofi_types.hpp"   // TradeEvent, BookLevelEvent
@@ -90,6 +91,9 @@ private:
 
     std::shared_ptr<auth::TokenManager> token_mgr_;
     std::shared_ptr<grpc::Channel>      channel_;
+    std::unique_ptr<
+    ::grpc::tradeapi::v1::marketdata::MarketDataService::Stub
+    > stub_;
 };
 
 } // namespace finam::market_data
