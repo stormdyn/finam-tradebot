@@ -1,11 +1,11 @@
 #include "token_manager.hpp"
 #include <stdexcept>
 #include <spdlog/spdlog.h>
-
-// TODO: подключить после первой успешной компиляции proto
-// #include "grpc/tradeapi/v1/auth/auth_service.grpc.pb.h"
+#include "grpc/tradeapi/v1/auth/auth_service.grpc.pb.h"
 
 namespace finam::auth {
+
+using AuthStub = ::grpc::tradeapi::v1::auth::AuthService::Stub;
 
 TokenManager::TokenManager(Config cfg)
     : cfg_(std::move(cfg))
@@ -14,12 +14,67 @@ TokenManager::TokenManager(Config cfg)
 
 TokenManager::~TokenManager() { shutdown(); }
 
-Result<void> TokenManager::init() {
-    spdlog::info("[Auth] stub init — proto not compiled yet");
-    store_jwt("stub-jwt");
-    account_ids_.push_back("stub-account");
+// ── Создание канала ────────────────────────────────────────────────────────
+
+static std::shared_ptr<grpc::Channel> make_channel(const TokenManagerConfig& cfg) {
+    if (cfg.use_tls) {
+        auto tls = grpc::SslCredentials(grpc::SslCredentialsOptions{});
+        return grpc::CreateChannel(cfg.endpoint, tls);
+    }
+    return grpc::CreateChannel(cfg.endpoint, grpc::InsecureChannelCredentials());
+}
+
+// ── init ───────────────────────────────────────────────────────────────────
+
+Result<void> TokenManager::init(std::string_view secret) {
+    channel_ = make_channel(cfg_);
+    auto stub = AuthStub(channel_);
+
+    // 1. Auth(secret) → JWT
+    ::grpc::tradeapi::v1::auth::AuthRequest req;
+    req.set_secret(std::string(secret));
+    ::grpc::tradeapi::v1::auth::AuthResponse resp;
+    grpc::ClientContext ctx;
+
+    const auto status = stub.Auth(&ctx, req, &resp);
+    if (!status.ok()) {
+        spdlog::error("[Auth] Auth() failed: {} {}",
+            status.error_code(), status.error_message());
+        return std::unexpected(Error{ErrorCode::RpcError, status.error_message()});
+    }
+    store_jwt(resp.token());
+    spdlog::info("[Auth] JWT obtained");
+
+    // 2. TokenDetails(jwt) → account_ids
+    ::grpc::tradeapi::v1::auth::TokenDetailsRequest det_req;
+    det_req.set_token(resp.token());
+    ::grpc::tradeapi::v1::auth::TokenDetailsResponse det_resp;
+    grpc::ClientContext det_ctx;
+    // Авторизуем запрос JWT
+    det_ctx.AddMetadata("authorization", "Bearer " + resp.token());
+
+    const auto det_status = stub.TokenDetails(&det_ctx, det_req, &det_resp);
+    if (!det_status.ok()) {
+        spdlog::error("[Auth] TokenDetails() failed: {}", det_status.error_message());
+        return std::unexpected(Error{ErrorCode::RpcError, det_status.error_message()});
+    }
+    for (const auto& id : det_resp.account_ids())
+        account_ids_.push_back(id);
+
+    if (account_ids_.empty()) {
+        spdlog::error("[Auth] No account_ids in token");
+        return std::unexpected(Error{ErrorCode::InvalidArgument, "no account_ids"});
+    }
+    spdlog::info("[Auth] accounts: {}", account_ids_.size());
+
+    // 3. Запускаем фоновый стрим обновления JWT
+    // Копируем secret — стрим живёт в отдельном потоке
+    renewal_thread_ = std::thread(&TokenManager::run_renewal_stream,
+                                  this, std::string(secret));
     return {};
 }
+
+// ── JWT accessors ─────────────────────────────────────────────────────────
 
 std::string TokenManager::jwt() const noexcept {
     return *jwt_.load(std::memory_order_acquire);
@@ -51,7 +106,42 @@ void TokenManager::store_jwt(std::string jwt) {
     );
 }
 
-Result<void> TokenManager::fetch_account_ids() { return {}; }
-void TokenManager::run_renewal_stream() {}
+// ── SubscribeJwtRenewal стрим ─────────────────────────────────────────────
+//
+// Сервер пушит новый JWT до истечения текущего.
+// Stream TTL = 86400s — штатный reconnect раз в сутки.
+// Техобслуживание 05:00-06:15 MSK — ждём и переподключаемся.
+
+void TokenManager::run_renewal_stream(std::string secret) {
+    spdlog::info("[Auth] JWT renewal stream started");
+
+    while (!stop_.load(std::memory_order_acquire)) {
+        auto stub = AuthStub(channel_);
+        grpc::ClientContext ctx;
+
+        ::grpc::tradeapi::v1::auth::SubscribeJwtRenewalRequest req;
+        req.set_secret(secret);
+
+        auto stream = stub.SubscribeJwtRenewal(&ctx, req);
+
+        ::grpc::tradeapi::v1::auth::SubscribeJwtRenewalResponse resp;
+        while (!stop_.load(std::memory_order_acquire) && stream->Read(&resp)) {
+            if (!resp.token().empty()) {
+                store_jwt(resp.token());
+                spdlog::debug("[Auth] JWT renewed");
+            }
+        }
+
+        if (stop_.load(std::memory_order_acquire)) break;
+
+        // Разрыв или TTL — reconnect через 5s
+        const auto st = stream->Finish();
+        spdlog::warn("[Auth] renewal stream ended: {} — reconnect in 5s",
+            st.error_message());
+        std::this_thread::sleep_for(std::chrono::seconds{5});
+    }
+
+    spdlog::info("[Auth] JWT renewal stream stopped");
+}
 
 } // namespace finam::auth

@@ -8,6 +8,7 @@ set(PROTO_ROOT    "${CMAKE_SOURCE_DIR}/vendor/finam-trade-api/proto")
 set(PROTO_GEN_DIR "${CMAKE_BINARY_DIR}/generated/proto")
 file(MAKE_DIRECTORY "${PROTO_GEN_DIR}")
 
+# API живёт в v1, не v2
 if(NOT EXISTS "${PROTO_ROOT}/grpc/tradeapi/v1/auth/auth_service.proto")
     message(FATAL_ERROR "Proto files not found! Run: git submodule update --init --recursive")
 endif()
