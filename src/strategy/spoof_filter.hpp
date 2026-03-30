@@ -6,31 +6,20 @@
 
 namespace finam::strategy {
 
-// Детектор spoofing/layering на уровнях стакана.
-//
-// Логика: для каждого price level отслеживаем:
-//   - кол-во появлений крупной заявки (ADD с размером > threshold)
-//   - кол-во отмен до исполнения (DELETE без предшествующего FILL)
-//
-// Если cancel_ratio = cancels / (cancels + fills) > max_cancel_ratio
-// на протяжении spoof_window → уровень помечается ненадёжным.
-//
-// Ненадёжный уровень исключается из расчёта MLOFI в OrderBookState.
-//
-// Вызывать из strategy thread вместе с OrderBookState.
 class SpoofFilter {
 public:
     struct Config {
-        double                    min_large_qty{10.0};    // порог "крупной" заявки (лотов)
-        double                    max_cancel_ratio{0.80}; // 80%+ отмен = spoof
-        uint32_t                  min_events{5};          // мин событий для оценки
-        std::chrono::seconds      spoof_window{60};       // окно наблюдения
-        std::chrono::seconds      flag_ttl{300};          // как долго уровень под подозрением
+        double               min_large_qty{10.0};
+        double               max_cancel_ratio{0.80};
+        uint32_t             min_events{5};
+        std::chrono::seconds spoof_window{60};
+        std::chrono::seconds flag_ttl{300};
+
+        Config() = default;
     };
 
     explicit SpoofFilter(Config cfg = {}) noexcept : cfg_(cfg) {}
 
-    // Вызывается при ADD крупной заявки
     void on_large_add(double price,
                       std::chrono::system_clock::time_point ts) noexcept {
         auto& s = stats_[round_price(price)];
@@ -39,7 +28,6 @@ public:
         evict_old(ts);
     }
 
-    // Вызывается при DELETE крупной заявки (до исполнения)
     void on_large_cancel(double price,
                          std::chrono::system_clock::time_point ts) noexcept {
         auto& s = stats_[round_price(price)];
@@ -48,14 +36,12 @@ public:
         evict_old(ts);
     }
 
-    // Вызывается при частичном/полном FILL крупной заявки
     void on_large_fill(double price,
                        std::chrono::system_clock::time_point /*ts*/) noexcept {
         auto& s = stats_[round_price(price)];
         ++s.fills;
     }
 
-    // Проверка: не стоит ли доверять этому уровню стакана?
     [[nodiscard]] bool is_spoofed(double price,
                                   std::chrono::system_clock::time_point now) const noexcept {
         const auto it = flagged_.find(round_price(price));
@@ -63,7 +49,6 @@ public:
         return (now - it->second) < cfg_.flag_ttl;
     }
 
-    // Сброс в начале сессии
     void session_reset() noexcept {
         stats_.clear();
         flagged_.clear();
@@ -90,7 +75,6 @@ private:
     }
 
     void evict_old(std::chrono::system_clock::time_point now) noexcept {
-        // Удаляем записи без активности дольше spoof_window
         for (auto it = stats_.begin(); it != stats_.end(); ) {
             if ((now - it->second.last_add_ts) > cfg_.spoof_window)
                 it = stats_.erase(it);
@@ -99,7 +83,6 @@ private:
         }
     }
 
-    // Округление до целого тика (упрощение: double→int64 ключ)
     [[nodiscard]] static int64_t round_price(double p) noexcept {
         return static_cast<int64_t>(std::round(p * 100.0));
     }

@@ -7,28 +7,20 @@
 
 namespace finam::strategy {
 
-// Анализатор потока исполненных сделок.
-//
-// Считает:
-//   - TFI  = buy_vol - sell_vol за скользящее окно tfi_window
-//   - CVD  = накопленный TFI с начала сессии (сброс в session_reset())
-//   - Tape velocity = кол-во сделок в секунду за velocity_window
-//   - Large print   = объём сделки > avg_volume * large_print_mult
-//
-// Поток вызовов: on_trade() → строго из strategy thread (SPSC-очередь).
 class TradeFlowAnalyzer {
 public:
     struct Config {
-        std::chrono::milliseconds tfi_window{5'000};      // окно TFI
-        std::chrono::milliseconds velocity_window{1'000}; // окно velocity
-        double   large_print_mult{4.0};  // кратность среднему объёму
-        uint32_t avg_volume_period{100}; // последних N сделок для avg
-        double   signal_threshold{0.3};  // |TFI_norm| > threshold → сигнал
+        std::chrono::milliseconds tfi_window{5'000};
+        std::chrono::milliseconds velocity_window{1'000};
+        double   large_print_mult{4.0};
+        uint32_t avg_volume_period{100};
+        double   signal_threshold{0.3};
+
+        Config() = default;
     };
 
     explicit TradeFlowAnalyzer(Config cfg = {}) noexcept : cfg_(cfg) {}
 
-    // Главный метод — вызывается на каждую исполненную сделку.
     TfiResult on_trade(const TradeEvent& e) noexcept {
         evict_old(e.ts);
 
@@ -40,7 +32,6 @@ public:
         return build_result(e);
     }
 
-    // Сброс CVD в начале новой сессии (10:00 MSK)
     void session_reset() noexcept {
         cvd_ = 0.0;
         window_.clear();
@@ -75,7 +66,6 @@ private:
             recent_volumes_.pop_front();
     }
 
-    // TFI нормализован на суммарный объём окна → [-1, +1]
     [[nodiscard]] double normalized_tfi() const noexcept {
         double buy_vol{}, sell_vol{};
         for (const auto& t : window_) {
@@ -98,7 +88,7 @@ private:
         TfiResult r;
         r.tfi      = normalized_tfi();
         r.cvd      = cvd_;
-        r.velocity = static_cast<double>(velocity_window_.size()); // trades/sec
+        r.velocity = static_cast<double>(velocity_window_.size());
         r.large_print = (e.volume > avg_volume() * cfg_.large_print_mult);
         r.ts       = e.ts;
         last_result_ = r;

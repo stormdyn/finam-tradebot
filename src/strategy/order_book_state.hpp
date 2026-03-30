@@ -7,26 +7,14 @@
 
 namespace finam::strategy {
 
-// Инкрементальный расчёт MLOFI по событиям стакана.
-//
-// Алгоритм (Xu, Gould, Howison 2019):
-//   OFI_k(t) = Δbid_size_k(t) − Δask_size_k(t)
-//   MLOFI = Σ w_k * OFI_k,  w_k = exp(−λ * k),  k = 0..kBookLevels-1
-//
-// Накапливается с экспоненциальным decay по времени:
-//   score(t) = score(t-1) * time_decay + ofi_delta
-//
-// Полностью lock-free при использовании из одного потока (strategy thread).
-// Вызывать on_book_event() из SPSC-очереди, не напрямую из gRPC callback.
 class OrderBookState {
 public:
     struct Config {
-        // Затухание по глубине: w_k = exp(-level_decay * k)
         double level_decay{0.5};
-        // Временное затухание score за 1 секунду
         double time_decay_per_sec{0.9};
-        // Порог сигнала — abs(score) > threshold → сигнал
         double signal_threshold{3.0};
+
+        Config() = default;
     };
 
     explicit OrderBookState(Config cfg = {}) noexcept
@@ -35,8 +23,6 @@ public:
         precompute_weights();
     }
 
-    // Вызывается при каждом событии обновления стакана.
-    // Возвращает актуальный MLOFI после обновления.
     MlofiResult on_book_event(const BookLevelEvent& e) noexcept {
         if (e.level < 0 || e.level >= kBookLevels) return last_result_;
 
@@ -53,7 +39,6 @@ public:
         return last_result_;
     }
 
-    // Принудительный пересчёт decay без нового события (по тику времени)
     MlofiResult decay_tick(std::chrono::system_clock::time_point now) noexcept {
         apply_time_decay(now);
         last_result_.ts = now;
@@ -62,7 +47,6 @@ public:
 
     [[nodiscard]] MlofiResult last() const noexcept { return last_result_; }
 
-    // Порог превышен — есть сигнал
     [[nodiscard]] Vote vote() const noexcept {
         if (score_ >  cfg_.signal_threshold) return Vote::Long;
         if (score_ < -cfg_.signal_threshold) return Vote::Short;
@@ -80,7 +64,6 @@ private:
     void precompute_weights() noexcept {
         for (int k = 0; k < kBookLevels; ++k)
             weights_[k] = std::exp(-cfg_.level_decay * static_cast<double>(k));
-        // нормализуем: Σw = 1
         const double sum = std::accumulate(weights_.begin(), weights_.end(), 0.0);
         for (auto& w : weights_) w /= sum;
     }
