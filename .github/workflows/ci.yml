@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build & Lint (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ── Системные зависимости ──────────────────────────────────────────────────
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build \
+            libgrpc++-dev libprotobuf-dev \
+            protobuf-compiler protobuf-compiler-grpc \
+            clang-tidy python3-pip
+
+      # ── Conan ──────────────────────────────────────────────────────────────────
+      - name: Install Conan
+        run: pip3 install --break-system-packages 'conan==2.*'
+
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan-${{ runner.os }}-${{ hashFiles('conanfile.txt') }}
+          restore-keys: conan-${{ runner.os }}-
+
+      - name: Conan profile detect
+        run: conan profile detect --force
+
+      - name: Conan install
+        run: |
+          conan install . \
+            --output-folder=build \
+            --build=missing \
+            -s compiler.cppstd=23 \
+            -s build_type=Release
+
+      # ── CMake configure ────────────────────────────────────────────────────────────
+      - name: CMake configure
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake \
+            -DCMAKE_CXX_STANDARD=23 \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      # ── Build ─────────────────────────────────────────────────────────────────────
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      # ── clang-tidy ─────────────────────────────────────────────────────────────────
+      # Проверяем только src/ (не вендор, не proto)
+      - name: clang-tidy
+        run: |
+          find src -name '*.cpp' | xargs clang-tidy \
+            -p build \
+            --config-file=.clangd \
+            --warnings-as-errors='' \
+            2>&1 | tee clang-tidy.log
+          # Не прерываем CI по предупреждениям — только по ошибкам
+          if grep -q 'error:' clang-tidy.log; then exit 1; fi
+        continue-on-error: false
+
+      - name: Upload clang-tidy log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-log
+          path: clang-tidy.log
+          retention-days: 7
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-24.04
+    needs: build  # запускаем только если build прошёл
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Кэшируем Docker слои по Dockerfile + lock-файлу
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: docker-${{ runner.os }}-${{ hashFiles('Dockerfile', 'conanfile.txt') }}
+          restore-keys: docker-${{ runner.os }}-
+
+      - name: Docker build (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: finam-tradebot:ci
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      # Предотвращаем неограниченный рост кэша
+      - name: Rotate Docker cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache

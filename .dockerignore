@@ -1,0 +1,6 @@
+build/
+.git/
+.clangd
+compile_commands.json
+CMakeUserPresets.json
+*.md
