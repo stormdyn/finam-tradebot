@@ -66,17 +66,17 @@ jobs:
       # ── clang-tidy ────────────────────────────────────────────────────────────
       - name: clang-tidy
         run: |
-          # Use clang-tidy-18 (ubuntu-24.04 default) with explicit C++23 standard.
-          # compile_commands.json already has -std=c++23 but clang-tidy may not
-          # pick up the stdlib headers without --extra-arg on some configurations.
-          # Filter only clang-diagnostic-error lines (not warnings) to fail the build.
+          # clang-tidy-18 on ubuntu-24.04 uses Clang's builtin headers by default.
+          # std::expected lives in GCC 13's libstdc++ at /usr/include/c++/13.
+          # We must point clang-tidy to GCC 13 toolchain so it finds <expected>.
+          GCC_INC=$(gcc -print-file-name=include-fixed | sed 's|/include-fixed||')
           TIDY=$(command -v clang-tidy-18 || command -v clang-tidy)
-          echo "Using: $TIDY"
+          echo "clang-tidy: $TIDY  gcc-install: $GCC_INC"
           find src -name '*.cpp' | xargs "$TIDY" \
             -p build \
             --config-file=.clang-tidy \
             --extra-arg=-std=c++23 \
-            --extra-arg=-stdlib=libstdc++ \
+            --extra-arg=--gcc-install-dir="$GCC_INC" \
             --warnings-as-errors='' \
             2>&1 | tee clang-tidy.log
           if grep -q 'error:' clang-tidy.log; then exit 1; fi

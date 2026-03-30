@@ -21,6 +21,10 @@ target_compile_options(project_warnings INTERFACE
     -Wno-unused-parameter
 )
 
+# enable_testing() must be called from root scope so CTest discovers tests
+# registered in subdirectories (include(CTest) in subdirs is not sufficient)
+enable_testing()
+
 add_subdirectory(proto)
 add_subdirectory(src)
 add_subdirectory(src/connectivity_check)

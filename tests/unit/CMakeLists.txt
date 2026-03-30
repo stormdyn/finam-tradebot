@@ -20,6 +20,8 @@ target_link_libraries(unit_tests PRIVATE
     project_warnings
 )
 
-include(CTest)
-include(Catch)
+# Catch2 3.x provides the Catch2 module (not legacy 'Catch').
+# DISCOVERY_MODE PRE_TEST (Catch2 3.x default) runs test discovery at ctest
+# time rather than build time, which works with cross-compilation and CI.
+include(Catch2)
 catch_discover_tests(unit_tests)
