@@ -288,4 +288,4 @@ private:
     std::chrono::system_clock::time_point last_signal_ts_{};
 };
 
-} // namespace finam::strategyф
+} // namespace finam::strategy
