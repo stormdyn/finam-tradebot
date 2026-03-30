@@ -88,5 +88,6 @@ TEST_CASE("ConfluenceStrategy: no entry without ORB finalized", "[confluence]") 
         .ts           = std::chrono::system_clock::now(),
     };
     const auto sig = strat.on_book_event(e);
-    CHECK(!sig.has_value() || sig->direction == Signal::Direction::None);
+    // Catch2 does not support || inside CHECK() — wrap in parens
+    CHECK((!sig.has_value() || sig->direction == Signal::Direction::None));
 }
