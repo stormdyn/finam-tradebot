@@ -66,9 +66,10 @@ jobs:
       # ── clang-tidy ────────────────────────────────────────────────────────────
       - name: clang-tidy
         run: |
+          # .clang-tidy is the config for clang-tidy; .clangd is for the LSP server
           find src -name '*.cpp' | xargs clang-tidy \
             -p build \
-            --config-file=.clangd \
+            --config-file=.clang-tidy \
             --warnings-as-errors='' \
             2>&1 | tee clang-tidy.log
           if grep -q 'error:' clang-tidy.log; then exit 1; fi
