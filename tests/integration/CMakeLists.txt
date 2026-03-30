@@ -20,7 +20,4 @@ target_link_libraries(integration_tests PRIVATE
     project_warnings
 )
 
-include(Catch2)
-catch_discover_tests(integration_tests
-    TEST_PREFIX "integration/"
-)
+add_test(NAME integration_tests COMMAND integration_tests)
