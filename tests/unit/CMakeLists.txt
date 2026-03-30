@@ -25,3 +25,4 @@ target_link_libraries(unit_tests PRIVATE
 # when Catch2 is installed via Conan (CMakeDeps doesn't expose the
 # Catch2 extras/ CMake module needed for catch_discover_tests).
 add_test(NAME unit_tests COMMAND unit_tests)
+set_tests_properties(unit_tests PROPERTIES TIMEOUT 60)

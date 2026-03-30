@@ -21,3 +21,6 @@ target_link_libraries(integration_tests PRIVATE
 )
 
 add_test(NAME integration_tests COMMAND integration_tests)
+# Hard timeout: gRPC in-process tests should finish in well under 10s.
+# If they hang (e.g. renewal thread not joining), CTest kills them.
+set_tests_properties(integration_tests PROPERTIES TIMEOUT 30)
