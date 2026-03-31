@@ -45,7 +45,7 @@ OrderStatus map_status(proto_orders::OrderStatus s) {
 
 } // namespace
 
-// ── OrderClient ───────────────────────────────────────────────────────────────────
+// ── OrderClient ───────────────────────────────────────────────────────────────
 
 OrderClient::OrderClient(
     std::shared_ptr<auth::TokenManager> token_mgr,
@@ -74,17 +74,18 @@ std::unique_ptr<grpc::ClientContext> OrderClient::make_context() const {
     return ctx;
 }
 
-int32_t OrderClient::next_id() noexcept {
+// FIX: int64_t
+int64_t OrderClient::next_id() noexcept {
     return id_counter_.fetch_add(1, std::memory_order_relaxed);
 }
 
-// ── submit ───────────────────────────────────────────────────────────────────────
+// ── submit ────────────────────────────────────────────────────────────────────
 
-Result<int32_t> OrderClient::submit(const OrderRequest& req) {
+Result<int64_t> OrderClient::submit(const OrderRequest& req) {
     if (auto err = validate(req))
         return std::unexpected(*err);
 
-    const int32_t local_id = next_id();
+    const int64_t local_id = next_id();  // FIX: int64_t
     const auto    sym      = req.symbol.to_string();
 
     spdlog::info("[Order] submit local_id={} symbol={} side={} type={} qty={} price={}",
@@ -138,7 +139,7 @@ Result<int32_t> OrderClient::submit(const OrderRequest& req) {
     return local_id;
 }
 
-// ── cancel ──────────────────────────────────────────────────────────────────────
+// ── cancel ────────────────────────────────────────────────────────────────────
 
 Result<void> OrderClient::cancel(int64_t order_no, std::string_view client_id) {
     spdlog::info("[Order] cancel order_no={} client_id={}", order_no, client_id);
@@ -159,7 +160,7 @@ Result<void> OrderClient::cancel(int64_t order_no, std::string_view client_id) {
     return {};
 }
 
-// ── active_orders / find ──────────────────────────────────────────────────────────
+// ── active_orders / find ──────────────────────────────────────────────────────
 
 std::vector<OrderState> OrderClient::active_orders() const {
     std::shared_lock lock(orders_mu_);
@@ -172,19 +173,18 @@ std::vector<OrderState> OrderClient::active_orders() const {
     return result;
 }
 
-std::optional<OrderState> OrderClient::find(int32_t local_id) const {
+std::optional<OrderState> OrderClient::find(int64_t local_id) const {  // FIX: int64_t
     std::shared_lock lock(orders_mu_);
     if (auto it = orders_.find(local_id); it != orders_.end())
         return it->second;
     return std::nullopt;
 }
 
-// ── upsert ─────────────────────────────────────────────────────────────────────────
+// ── upsert ────────────────────────────────────────────────────────────────────
 
 void OrderClient::upsert(OrderState state) {
-    const int32_t lid = state.local_id;
+    const int64_t lid = state.local_id;  // FIX: int64_t
 
-    // Дельта qty_filled для правильного on_fill в RiskManager
     int32_t prev_filled = 0;
     {
         std::shared_lock rlock(orders_mu_);
@@ -195,7 +195,7 @@ void OrderClient::upsert(OrderState state) {
 
     OrderUpdate upd{
         .order_no       = 0,
-        .transaction_id = lid,
+        .transaction_id = static_cast<int32_t>(lid),  // transaction_id остаётся int32_t
         .symbol         = state.symbol,
         .client_id      = account_id_,
         .side           = state.side,
@@ -213,12 +213,10 @@ void OrderClient::upsert(OrderState state) {
         orders_[lid] = std::move(state);
     }
 
-    // invoke_callback блокирует cb_mu_ — вызываем после orders_mu_,
-    // чтобы избежать deadlock если callback обращается к cancel()
     invoke_callback(upd);
 }
 
-// ── run_order_stream ──────────────────────────────────────────────────────────────
+// ── run_order_stream ──────────────────────────────────────────────────────────
 
 void OrderClient::run_order_stream() {
     spdlog::info("[Order] order stream started account={}", account_id_);
@@ -236,10 +234,10 @@ void OrderClient::run_order_stream() {
         proto_orders::SubscribeOrdersResponse resp;
         while (!stop_.load(std::memory_order_acquire) && stream->Read(&resp)) {
             for (const auto& o : resp.orders()) {
-                int32_t local_id  = 0;
+                int64_t local_id  = 0;  // FIX: int64_t + stol вместо stoi
                 int32_t qty_total = 0;
                 int32_t filled    = 0;
-                try { local_id  = std::stoi(o.order().client_order_id()); } catch (...) {}
+                try { local_id  = std::stol(o.order().client_order_id()); } catch (...) {}
                 try { qty_total = static_cast<int32_t>(std::stod(o.initial_quantity().value())); } catch (...) {}
                 try { filled    = static_cast<int32_t>(std::stod(o.executed_quantity().value())); } catch (...) {}
 
