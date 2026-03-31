@@ -69,14 +69,12 @@ struct Quote {
 };
 
 // Bar содержит таймфрейм чтобы стратегия могла различать D1 от M1
-// Без этого поля detect_timeframe() был невозможен без heuristic по duration
 struct Bar {
     Symbol      symbol;
     std::string timeframe;  // "D1", "M1", "M5", "H1" — заполняет MarketDataClient
     double      open{}, high{}, low{}, close{};
     int64_t     volume{};
     Timestamp   ts;
-    // date: используется в backtest для человеческого лога/CSV (заполняет load_csv)
     std::string date;
 };
 
@@ -154,7 +152,9 @@ class IOrderExecutor {
 public:
     virtual ~IOrderExecutor() = default;
 
-    virtual Result<int32_t> submit(const OrderRequest& req)    = 0;
+    // FIX: возвращает int64_t — Finam order_no всегда 64-bit.
+    // Старый int32_t вызывал несоответствие типов с cancel(int64_t order_no).
+    virtual Result<int64_t> submit(const OrderRequest& req)    = 0;
     virtual Result<void>    cancel(int64_t order_no,
                                    std::string_view client_id) = 0;
 };

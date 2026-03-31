@@ -17,10 +17,18 @@
 #include "strategy/strategy_runner.hpp"
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
+//
+// FIX: POSIX гарантирует async-signal safety только для volatile sig_atomic_t.
+// std::atomic<bool>::store() в signal handler — формально UB по C++ стандарту.
+// Решение: sig_atomic_t как primary флаг (безопасен в handler), std::atomic<bool>
+// как secondary для корректного happens-before в main loop.
 
-static std::atomic<bool> g_shutdown{false};
+static volatile sig_atomic_t g_shutdown_signal = 0;
+static std::atomic<bool>     g_shutdown{false};
+
 static void signal_handler(int) noexcept {
-    g_shutdown.store(true, std::memory_order_release);
+    g_shutdown_signal = 1;  // async-signal-safe
+    g_shutdown.store(true, std::memory_order_relaxed);
 }
 
 // ── Logging ───────────────────────────────────────────────────────────────────
@@ -52,7 +60,9 @@ static void setup_logging(bool debug_mode) {
 
 class DryRunExecutor final : public finam::IOrderExecutor {
 public:
-    finam::Result<int32_t> submit(const finam::OrderRequest& req) override {
+    // FIX: int64_t — приведено в соответствие с IOrderExecutor::submit и
+    // Finam API (order_no — всегда 64-bit integer).
+    finam::Result<int64_t> submit(const finam::OrderRequest& req) override {
         spdlog::info("[DryRun] SUBMIT symbol={} side={} type={} qty={} price={}",
             req.symbol.to_string(),
             req.side == finam::OrderSide::Buy ? "BUY" : "SELL",
@@ -65,7 +75,7 @@ public:
         return {};
     }
 private:
-    int32_t id_{0};
+    int64_t id_{0};  // FIX: int64_t вместо int32_t
 };
 
 // ── SymbolConfig ──────────────────────────────────────────────────────────────
@@ -133,14 +143,12 @@ int main(int argc, char* argv[]) {
     spdlog::info("Authenticated, account: {}", account_id);
 
     // ── Risk ──────────────────────────────────────────────────────────────────
-    // Single RiskManager shared across all symbols.
-    // max_positions = total open positions across all instruments.
     auto risk = std::make_shared<finam::risk::RiskManager>(
         finam::risk::RiskConfig{
             .per_trade_pct      = 2.0,
             .max_daily_loss_pct = 5.0,
             .max_drawdown_pct   = 15.0,
-            .max_positions      = 3,    // across ALL symbols combined
+            .max_positions      = 3,
             .require_stop_loss  = true,
             .rollover_days      = 5,
         },
@@ -149,11 +157,9 @@ int main(int argc, char* argv[]) {
     risk->start();
 
     // ── Market data ───────────────────────────────────────────────────────────
-    // Single shared connection — all runners multiplex over it.
     auto md = std::make_shared<finam::market_data::MarketDataClient>(token_mgr);
 
     // ── Executor ──────────────────────────────────────────────────────────────
-    // DryRunExecutor is per-submit stateless, safe to share.
     std::shared_ptr<finam::IOrderExecutor>     executor;
     std::shared_ptr<finam::order::OrderClient> order_client;
     if (dry_run) {
@@ -165,19 +171,6 @@ int main(int argc, char* argv[]) {
     }
 
     // ── Strategy runners (one per symbol) ────────────────────────────────────
-    //
-    // Each runner has its own:
-    //   - ConfluenceStrategy instance (OFI state, session context, etc.)
-    //   - SPSC event queue
-    //   - strategy thread + rollover thread
-    //   - MD subscriptions (order book, trades, bars, quotes)
-    //
-    // All runners share: TokenManager, MarketDataClient, IOrderExecutor,
-    //                    RiskManager (for margin + daily loss checks).
-    //
-    // Threading: N strategy threads + N rollover threads + 1 risk poll thread
-    //            + gRPC MD callback threads.  No cross-runner locking.
-
     const auto symbol_cfgs = make_symbol_configs();
     std::vector<std::unique_ptr<finam::strategy::StrategyRunner>> runners;
     runners.reserve(symbol_cfgs.size());
@@ -205,9 +198,6 @@ int main(int argc, char* argv[]) {
         ));
     }
 
-    // Wire order callbacks: OrderClient broadcasts to all runners.
-    // Each runner's callback filters by symbol internally, so only the
-    // runner that placed the order will actually process the update.
     if (order_client) {
         std::vector<finam::order::OrderUpdateCallback> cbs;
         cbs.reserve(runners.size());
@@ -224,7 +214,6 @@ int main(int argc, char* argv[]) {
     // ── Health server ─────────────────────────────────────────────────────────
     finam::core::HealthServer health{8080, [&] {
         const auto st = risk->account_state();
-        // Report active symbols as comma-separated list
         std::string symbols;
         for (const auto& sc : symbol_cfgs) {
             if (!symbols.empty()) { symbols += ','; }
@@ -244,13 +233,15 @@ int main(int argc, char* argv[]) {
         runners.size());
 
     // ── Main loop ─────────────────────────────────────────────────────────────
-    while (!g_shutdown.load(std::memory_order_acquire))
+    // FIX: проверяем оба флага — sig_atomic_t (async-signal-safe) и atomic<bool>
+    // (memory_order_acquire для корректного happens-before с другими потоками).
+    while (!g_shutdown_signal && !g_shutdown.load(std::memory_order_acquire))
         std::this_thread::sleep_for(std::chrono::seconds{1});
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
     spdlog::info("Shutting down {} runners...", runners.size());
     health.stop();
-    runners.clear();  // destroys runners in reverse order, joins their threads
+    runners.clear();
     if (order_client) { order_client->shutdown(); }
     risk->shutdown();
     token_mgr->shutdown();

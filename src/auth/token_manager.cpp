@@ -66,7 +66,9 @@ Result<void> TokenManager::init(std::string_view secret) {
     }
     spdlog::info("[Auth] accounts: {}", account_ids_.size());
 
-    // 3. Запуск фонового стрима обновления JWT
+    // 3. Запуск фонового стрима обновления JWT.
+    // secret копируется по значению — по завершению потока обнуляется
+    // через secure_zero() чтобы не светиться в coredump.
     renewal_thread_ = std::thread(&TokenManager::run_renewal_stream,
                                   this, std::string(secret));
     return {};
@@ -104,6 +106,15 @@ void TokenManager::store_jwt(std::string jwt) {
     );
 }
 
+// FIX: безопасное обнуление памяти строки.
+// volatile + побайтовая запись — гарантирует, что компилятор не выкинет
+// обнуление как «мёртвый код» (в отличие от обычного memset).
+static void secure_zero(std::string& s) noexcept {
+    volatile char* p = s.data();
+    for (std::size_t i = 0; i < s.size(); ++i)
+        p[i] = '\0';
+}
+
 // ── SubscribeJwtRenewal стрим ─────────────────────────────────────────────
 
 void TokenManager::run_renewal_stream(std::string secret) {
@@ -134,6 +145,9 @@ void TokenManager::run_renewal_stream(std::string secret) {
         std::this_thread::sleep_for(std::chrono::seconds{5});
     }
 
+    // FIX: обнуляем секрет перед выходом из потока.
+    // Предотвращает утечку токена через coredump или /proc/<pid>/mem.
+    secure_zero(secret);
     spdlog::info("[Auth] JWT renewal stream stopped");
 }
 
