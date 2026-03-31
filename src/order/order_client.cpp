@@ -28,24 +28,57 @@ void set_decimal(google::type::Decimal* d, double v) {
     d->set_value(buf);
 }
 
+// Полная таблица статусов из proto (orders_service.proto).
+// Дефолт на Pending был неправильным: EXPIRED/FAILED/DONE_FOR_DAY
+// трактовались как живые ордера, что ломало логику стратегии.
 OrderStatus map_status(proto_orders::OrderStatus s) {
     using PS = proto_orders::OrderStatus;
     switch (s) {
-        case PS::ORDER_STATUS_NEW:              return OrderStatus::Pending;
+        // Живые
+        case PS::ORDER_STATUS_NEW:           return OrderStatus::Pending;
+        case PS::ORDER_STATUS_PENDING_NEW:   return OrderStatus::Pending;
+        case PS::ORDER_STATUS_PENDING_CANCEL:return OrderStatus::Pending;
+        case PS::ORDER_STATUS_SUSPENDED:     return OrderStatus::Pending;
+        case PS::ORDER_STATUS_WATCHING:      return OrderStatus::Pending;
+        case PS::ORDER_STATUS_WAIT:          return OrderStatus::Pending;
+        case PS::ORDER_STATUS_LINK_WAIT:     return OrderStatus::Pending;
+        case PS::ORDER_STATUS_FORWARDING:    return OrderStatus::Pending;
+        case PS::ORDER_STATUS_SL_FORWARDING: return OrderStatus::Pending;
+        case PS::ORDER_STATUS_TP_FORWARDING: return OrderStatus::Pending;
+        case PS::ORDER_STATUS_SL_GUARD_TIME: return OrderStatus::Pending;
+        case PS::ORDER_STATUS_TP_GUARD_TIME: return OrderStatus::Pending;
+        case PS::ORDER_STATUS_TP_CORRECTION: return OrderStatus::Pending;
+        case PS::ORDER_STATUS_TP_CORR_GUARD_TIME: return OrderStatus::Pending;
+        // Частичное исполнение
         case PS::ORDER_STATUS_PARTIALLY_FILLED: return OrderStatus::PartialFill;
-        case PS::ORDER_STATUS_FILLED:           return OrderStatus::Filled;
-        case PS::ORDER_STATUS_EXECUTED:         return OrderStatus::Filled;
-        case PS::ORDER_STATUS_CANCELED:         return OrderStatus::Cancelled;
-        case PS::ORDER_STATUS_REJECTED:
-        case PS::ORDER_STATUS_REJECTED_BY_EXCHANGE:
-        case PS::ORDER_STATUS_DENIED_BY_BROKER: return OrderStatus::Rejected;
-        default:                                return OrderStatus::Pending;
+        // Полное исполнение
+        case PS::ORDER_STATUS_FILLED:        return OrderStatus::Filled;
+        case PS::ORDER_STATUS_EXECUTED:      return OrderStatus::Filled;
+        case PS::ORDER_STATUS_SL_EXECUTED:   return OrderStatus::Filled;
+        case PS::ORDER_STATUS_TP_EXECUTED:   return OrderStatus::Filled;
+        // Отменены / завершены
+        case PS::ORDER_STATUS_CANCELED:      return OrderStatus::Cancelled;
+        case PS::ORDER_STATUS_REPLACED:      return OrderStatus::Cancelled;
+        case PS::ORDER_STATUS_DONE_FOR_DAY:  return OrderStatus::Cancelled;
+        case PS::ORDER_STATUS_EXPIRED:       return OrderStatus::Cancelled;
+        case PS::ORDER_STATUS_DISABLED:      return OrderStatus::Cancelled;
+        // Отклонены
+        case PS::ORDER_STATUS_REJECTED:            return OrderStatus::Rejected;
+        case PS::ORDER_STATUS_REJECTED_BY_EXCHANGE:return OrderStatus::Rejected;
+        case PS::ORDER_STATUS_DENIED_BY_BROKER:    return OrderStatus::Rejected;
+        case PS::ORDER_STATUS_FAILED:              return OrderStatus::Rejected;
+        // Неизвестные новые статусы — оставляем как Pending
+        // и пишем предупреждение, чтобы заметить в логах
+        default:
+            spdlog::warn("[Order] unknown OrderStatus={}, treating as Pending",
+                static_cast<int>(s));
+            return OrderStatus::Pending;
     }
 }
 
 } // namespace
 
-// ── OrderClient ───────────────────────────────────────────────────────────────
+// ── OrderClient ────────────────────────────────────────────────────────────────────
 
 OrderClient::OrderClient(
     std::shared_ptr<auth::TokenManager> token_mgr,
@@ -74,18 +107,17 @@ std::unique_ptr<grpc::ClientContext> OrderClient::make_context() const {
     return ctx;
 }
 
-// FIX: int64_t
 int64_t OrderClient::next_id() noexcept {
     return id_counter_.fetch_add(1, std::memory_order_relaxed);
 }
 
-// ── submit ────────────────────────────────────────────────────────────────────
+// ── submit ──────────────────────────────────────────────────────────────────────────
 
 Result<int64_t> OrderClient::submit(const OrderRequest& req) {
     if (auto err = validate(req))
         return std::unexpected(*err);
 
-    const int64_t local_id = next_id();  // FIX: int64_t
+    const int64_t local_id = next_id();
     const auto    sym      = req.symbol.to_string();
 
     spdlog::info("[Order] submit local_id={} symbol={} side={} type={} qty={} price={}",
@@ -139,14 +171,33 @@ Result<int64_t> OrderClient::submit(const OrderRequest& req) {
     return local_id;
 }
 
-// ── cancel ────────────────────────────────────────────────────────────────────
+// ── cancel ──────────────────────────────────────────────────────────────────────────
 
-Result<void> OrderClient::cancel(int64_t order_no, std::string_view client_id) {
-    spdlog::info("[Order] cancel order_no={} client_id={}", order_no, client_id);
+Result<void> OrderClient::cancel(int64_t local_id, std::string_view) {
+    // CancelOrderRequest.order_id — биржевой string ID из OrderState.order_id,
+    // НЕ наш локальный счётчик.
+    std::string exchange_order_id;
+    {
+        std::shared_lock lock(orders_mu_);
+        auto it = orders_.find(local_id);
+        if (it == orders_.end()) {
+            spdlog::error("[Order] cancel: local_id={} not found in orders map", local_id);
+            return std::unexpected(Error{ErrorCode::InvalidArgument,
+                "order local_id=" + std::to_string(local_id) + " not found"});
+        }
+        exchange_order_id = it->second.order_id;
+    }
+
+    if (exchange_order_id.empty()) {
+        spdlog::error("[Order] cancel: local_id={} has empty exchange order_id", local_id);
+        return std::unexpected(Error{ErrorCode::InvalidArgument, "exchange order_id is empty"});
+    }
+
+    spdlog::info("[Order] cancel local_id={} exchange_order_id={}", local_id, exchange_order_id);
 
     proto_orders::CancelOrderRequest req;
     req.set_account_id(account_id_);
-    req.set_order_id(std::to_string(order_no));
+    req.set_order_id(exchange_order_id);  // биржевой ID
 
     proto_orders::OrderState resp;
     auto ctx = make_context();
@@ -160,7 +211,7 @@ Result<void> OrderClient::cancel(int64_t order_no, std::string_view client_id) {
     return {};
 }
 
-// ── active_orders / find ──────────────────────────────────────────────────────
+// ── active_orders / find ────────────────────────────────────────────────────────────
 
 std::vector<OrderState> OrderClient::active_orders() const {
     std::shared_lock lock(orders_mu_);
@@ -173,17 +224,17 @@ std::vector<OrderState> OrderClient::active_orders() const {
     return result;
 }
 
-std::optional<OrderState> OrderClient::find(int64_t local_id) const {  // FIX: int64_t
+std::optional<OrderState> OrderClient::find(int64_t local_id) const {
     std::shared_lock lock(orders_mu_);
     if (auto it = orders_.find(local_id); it != orders_.end())
         return it->second;
     return std::nullopt;
 }
 
-// ── upsert ────────────────────────────────────────────────────────────────────
+// ── upsert ──────────────────────────────────────────────────────────────────────────
 
 void OrderClient::upsert(OrderState state) {
-    const int64_t lid = state.local_id;  // FIX: int64_t
+    const int64_t lid = state.local_id;
 
     int32_t prev_filled = 0;
     {
@@ -195,7 +246,7 @@ void OrderClient::upsert(OrderState state) {
 
     OrderUpdate upd{
         .order_no       = 0,
-        .transaction_id = static_cast<int32_t>(lid),  // transaction_id остаётся int32_t
+        .transaction_id = static_cast<int32_t>(lid),
         .symbol         = state.symbol,
         .client_id      = account_id_,
         .side           = state.side,
@@ -216,7 +267,7 @@ void OrderClient::upsert(OrderState state) {
     invoke_callback(upd);
 }
 
-// ── run_order_stream ──────────────────────────────────────────────────────────
+// ── run_order_stream ─────────────────────────────────────────────────────────────
 
 void OrderClient::run_order_stream() {
     spdlog::info("[Order] order stream started account={}", account_id_);
@@ -234,7 +285,7 @@ void OrderClient::run_order_stream() {
         proto_orders::SubscribeOrdersResponse resp;
         while (!stop_.load(std::memory_order_acquire) && stream->Read(&resp)) {
             for (const auto& o : resp.orders()) {
-                int64_t local_id  = 0;  // FIX: int64_t + stol вместо stoi
+                int64_t local_id  = 0;
                 int32_t qty_total = 0;
                 int32_t filled    = 0;
                 try { local_id  = std::stol(o.order().client_order_id()); } catch (...) {}
