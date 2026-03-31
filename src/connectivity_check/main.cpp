@@ -1,12 +1,19 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
-#include <set>
 #include <spdlog/spdlog.h>
 
 #include "auth/token_manager.hpp"
 #include "grpc/tradeapi/v1/accounts/accounts_service.grpc.pb.h"
 #include "grpc/tradeapi/v1/assets/assets_service.grpc.pb.h"
+
+// ──────────────────────────────────────────────────────────────────────────
+// connectivity_check:
+//   1. Auth
+//   2. GetAccount (equity)
+//   3. Exchanges() — все MIC-коды доступных бирж
+//   4. GetAsset для набора кандидатов Si-фьючерса (разные MIC и тикеры)
+// ──────────────────────────────────────────────────────────────────────────
 
 static finam::Result<void> check_account(const finam::auth::TokenManager& mgr) {
     namespace A = ::grpc::tradeapi::v1::accounts;
@@ -18,8 +25,7 @@ static finam::Result<void> check_account(const finam::auth::TokenManager& mgr) {
     A::GetAccountResponse resp;
     if (const auto st = stub->GetAccount(&ctx, req, &resp); !st.ok())
         return std::unexpected(finam::Error{finam::ErrorCode::RpcError, st.error_message()});
-    spdlog::info("[3/4] equity={} forts_cash={}",
-        resp.equity().value(), resp.portfolio_forts().available_cash().value());
+    spdlog::info("[2/4] equity={}", resp.equity().value());
     return {};
 }
 
@@ -38,69 +44,66 @@ int main() {
         spdlog::critical("[1/4] FAIL: {}", r.error().message); return 1;
     }
     spdlog::info("[1/4] OK  account_id={}", mgr->primary_account_id());
-    spdlog::info("[2/4] OK");
 
-    spdlog::info("[3/4] GetAccount...");
     if (auto r = check_account(*mgr); !r) {
-        spdlog::critical("[3/4] FAIL: {}", r.error().message); return 1;
+        spdlog::critical("[2/4] FAIL: {}", r.error().message); return 1;
     }
-    spdlog::info("[3/4] OK");
-
-    // ── Полный обход AllAssets через пагинацию ──────────────────────
-    spdlog::info("[4/4] AllAssets full scan — ищем FORTS...");
 
     namespace AS = ::grpc::tradeapi::v1::assets;
     auto stub = AS::AssetsService::NewStub(mgr->channel());
 
-    int64_t cursor    = 0;
-    int     page      = 0;
-    int     total     = 0;
-    std::set<std::string> forts_types;  // уникальные type у FORTS-инструментов
-
-    std::vector<AS::Asset> forts_assets;
-
-    while (true) {
+    // ── 3. Exchanges — все доступные MIC коды ────────────────────────────
+    {
         grpc::ClientContext ctx;
         ctx.AddMetadata("authorization", "Bearer " + mgr->jwt());
-        AS::AllAssetsRequest req;
-        req.set_cursor(cursor);
-        req.set_only_active(true);
-        AS::AllAssetsResponse resp;
-
-        const auto st = stub->AllAssets(&ctx, req, &resp);
+        AS::ExchangesRequest req;
+        AS::ExchangesResponse resp;
+        const auto st = stub->Exchanges(&ctx, req, &resp);
         if (!st.ok()) {
-            spdlog::error("[4/4] page={} FAIL: {}", page, st.error_message());
-            break;
+            spdlog::error("[3/4] Exchanges FAIL: {}", st.error_message());
+        } else {
+            spdlog::info("[3/4] Exchanges: {} бирж:", resp.exchanges_size());
+            for (const auto& e : resp.exchanges())
+                spdlog::info("  mic={:<20s}  name={}", e.mic(), e.name());
         }
-
-        total += resp.assets_size();
-        for (const auto& a : resp.assets()) {
-            if (a.mic() == "FORTS") {
-                forts_types.insert(a.type());
-                forts_assets.push_back(a);
-            }
-        }
-
-        spdlog::info("[4/4] page={} got={} total={} forts_so_far={} next_cursor={}",
-            page, resp.assets_size(), total, forts_assets.size(), resp.next_cursor());
-
-        if (resp.next_cursor() == 0 || resp.assets_size() == 0) break;
-        cursor = resp.next_cursor();
-        ++page;
     }
 
-    spdlog::info("");
-    spdlog::info("══ FORTS: {} инструментов, уникальных type: {} ══",
-        forts_assets.size(), forts_types.size());
-    for (const auto& t : forts_types)
-        spdlog::info("  type = '{}'", t);
+    // ── 4. Проба GetAsset для Si: разные MIC + тикеры ────────────────
+    // Буквы кварталов: H=март, M=июнь, U=сентябрь, Z=декабрь
+    // Текущий квартал июнь 2026
+    const std::vector<std::string> si_candidates = {
+        // формат ticker@MIC с разными MIC-кодами
+        "SiM6@FORTS",  "SIM6@FORTS",  "SiM26@FORTS", "SIM26@FORTS",
+        "Si-6.26@FORTS",
+        // возможные альтернативные MIC
+        "SiM6@RFUD",   "SiM6@SPBFUT", "SiM6@SPBX",
+        "SiM6@MOEX",   "SiM6@XMOS",
+        // без года
+        "SiM@FORTS",   "Si-M@FORTS",
+        // полная дата
+        "Si-6.2026@FORTS",
+    };
 
-    spdlog::info("");
-    spdlog::info("══ ВСЕ FORTS инструменты (symbol | ticker | type | name) ══");
-    for (const auto& a : forts_assets) {
-        spdlog::info("  symbol={:<30s} ticker={:<12s} type={:<20s} name={}",
-            a.symbol(), a.ticker(), a.type(), a.name());
+    spdlog::info("[4/4] GetAsset проба для Si:");
+    for (const auto& sym : si_candidates) {
+        grpc::ClientContext ctx;
+        ctx.AddMetadata("authorization", "Bearer " + mgr->jwt());
+        AS::GetAssetRequest req;
+        req.set_symbol(sym);
+        req.set_account_id(std::string(mgr->primary_account_id()));
+        AS::GetAssetResponse resp;
+        const auto st = stub->GetAsset(&ctx, req, &resp);
+        if (st.ok()) {
+            spdlog::info("  ✔ symbol={} => board={} ticker={} mic={} type={} decimals={} expiry={}-{}-{}",
+                sym, resp.board(), resp.ticker(), resp.mic(), resp.type(),
+                resp.decimals(),
+                resp.expiration_date().year(),
+                resp.expiration_date().month(),
+                resp.expiration_date().day());
+        } else {
+            spdlog::info("  ✗ {} => {}", sym, st.error_message());
+        }
     }
 
-    return forts_assets.empty() ? 1 : 0;
+    return 0;
 }
