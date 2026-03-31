@@ -10,7 +10,7 @@ static Bar make_bar(double o, double h, double l, double c,
                     std::string_view tf = "D1")
 {
     return Bar{
-        .symbol    = Symbol{"Si-6.26", "FORTS"},
+        .symbol    = Symbol{"SiM6", "RTSX"},
         .timeframe = std::string(tf),
         .open      = o, .high = h, .low = l, .close = c,
         .volume    = 1000,
