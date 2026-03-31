@@ -11,7 +11,7 @@
 
 namespace finam::market_data {
 
-// ── Helpers ──────────────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────────────────
 
 namespace {
 
@@ -20,6 +20,8 @@ double decimal_to_double(const google::type::Decimal& d) noexcept {
     catch (...) { return 0.0; }
 }
 
+// Полная таблица таймфреймов из proto (marketdata_service.proto enum TimeFrame).
+// Глубина данных: M1=7д, M5/M15/M30/H1/H2/H4/H8=30д, D=365д, W/MN/QR=365*5д.
 ::grpc::tradeapi::v1::marketdata::TimeFrame timeframe_to_proto(
     std::string_view tf) noexcept
 {
@@ -31,8 +33,11 @@ double decimal_to_double(const google::type::Decimal& d) noexcept {
     if (tf == "H1")  return TF::TIME_FRAME_H1;
     if (tf == "H2")  return TF::TIME_FRAME_H2;
     if (tf == "H4")  return TF::TIME_FRAME_H4;
+    if (tf == "H8")  return TF::TIME_FRAME_H8;   // fix: раньше отсутствовал
     if (tf == "D1")  return TF::TIME_FRAME_D;
     if (tf == "W1")  return TF::TIME_FRAME_W;
+    if (tf == "MN")  return TF::TIME_FRAME_MN;   // fix: раньше отсутствовал
+    if (tf == "QR")  return TF::TIME_FRAME_QR;   // fix: раньше отсутствовал
     spdlog::warn("[MD] Unknown timeframe '{}', fallback M1", tf);
     return TF::TIME_FRAME_M1;
 }
@@ -50,7 +55,6 @@ Symbol symbol_from_string(const std::string& s) {
     return Symbol{s.substr(0, at), s.substr(at + 1)};
 }
 
-// attempt — текущая попытка (0-based), задержка будет base*2^attempt
 void log_reconnect(std::string_view name, int attempt) noexcept {
     const int delay_ms = static_cast<int>(
         std::min(500.0 * (1 << std::min(attempt, 6)), 30000.0));
@@ -60,7 +64,7 @@ void log_reconnect(std::string_view name, int attempt) noexcept {
 
 } // namespace
 
-// ── MarketDataClient ───────────────────────────────────────────────────────────────────
+// ── MarketDataClient ─────────────────────────────────────────────────────────────────────────────
 
 MarketDataClient::MarketDataClient(
     std::shared_ptr<auth::TokenManager> token_mgr)
@@ -81,7 +85,7 @@ std::unique_ptr<grpc::ClientContext> MarketDataClient::make_context() const {
     return ctx;
 }
 
-// ── get_bars ────────────────────────────────────────────────────────────────────────
+// ── get_bars ─────────────────────────────────────────────────────────────────────────────
 
 Result<std::vector<Bar>> MarketDataClient::get_bars(
     const Symbol&    symbol,
@@ -130,7 +134,7 @@ Result<std::vector<Bar>> MarketDataClient::get_bars(
     return bars;
 }
 
-// ── subscribe_quotes ──────────────────────────────────────────────────────────────────
+// ── subscribe_quotes ───────────────────────────────────────────────────────────────────────────
 
 SubscriptionHandle MarketDataClient::subscribe_quotes(
     std::vector<Symbol> symbols,
@@ -169,7 +173,7 @@ SubscriptionHandle MarketDataClient::subscribe_quotes(
                         .ts     = ts_from_proto(q.timestamp()),
                     });
                 }
-                bo.reset();  // успешное чтение — сбрасываем backoff
+                bo.reset();
             }
             stream->Finish();
 
@@ -187,7 +191,7 @@ SubscriptionHandle MarketDataClient::subscribe_quotes(
     });
 }
 
-// ── subscribe_bars ───────────────────────────────────────────────────────────────────
+// ── subscribe_bars ────────────────────────────────────────────────────────────────────────────
 
 SubscriptionHandle MarketDataClient::subscribe_bars(
     const Symbol&    symbol,
@@ -248,7 +252,7 @@ SubscriptionHandle MarketDataClient::subscribe_bars(
     });
 }
 
-// ── subscribe_order_book ───────────────────────────────────────────────────────────────
+// ── subscribe_order_book ───────────────────────────────────────────────────────────────────────────
 
 SubscriptionHandle MarketDataClient::subscribe_order_book(
     const Symbol&     symbol,
@@ -275,30 +279,40 @@ SubscriptionHandle MarketDataClient::subscribe_order_book(
 
             SubscribeOrderBookResponse resp;
             while (!stop->load() && stream->Read(&resp)) {
+                // Применяем все дельты из всех StreamOrderBook в одном gRPC-сообщении,
+                // затем файрим callback один раз — с полным снапшотом.
+                // Раньше callback вызывался внутри внутреннего for, что отправляло
+                // стратегии промежуточные полуобновлённые снапшоты.
                 for (const auto& sob : resp.order_book()) {
                     for (const auto& row : sob.rows()) {
                         const double price = decimal_to_double(row.price());
-                        constexpr int kRemove = 1;
-                        const int act = static_cast<int>(row.action());
+                        using Action = StreamOrderBook::Row::Action;
+                        const auto act = row.action();
 
                         if (row.has_buy_size()) {
                             const double qty = decimal_to_double(row.buy_size());
-                            if (act == kRemove || qty < 1e-9) bids_map.erase(price);
-                            else bids_map[price] = OrderBookRow{price, static_cast<int64_t>(qty)};
+                            if (act == Action::ACTION_REMOVE || qty < 1e-9)
+                                bids_map.erase(price);
+                            else
+                                bids_map[price] = OrderBookRow{price, static_cast<int64_t>(qty)};
                         } else if (row.has_sell_size()) {
                             const double qty = decimal_to_double(row.sell_size());
-                            if (act == kRemove || qty < 1e-9) asks_map.erase(price);
-                            else asks_map[price] = OrderBookRow{price, static_cast<int64_t>(qty)};
+                            if (act == Action::ACTION_REMOVE || qty < 1e-9)
+                                asks_map.erase(price);
+                            else
+                                asks_map[price] = OrderBookRow{price, static_cast<int64_t>(qty)};
                         }
                     }
-
-                    OrderBook book;
-                    book.ts     = std::chrono::system_clock::now();
-                    book.symbol = symbol_from_string(sym_str);
-                    for (auto& [p, r] : bids_map) book.bids.push_back(r);
-                    for (auto& [p, r] : asks_map) book.asks.push_back(r);
-                    callback(book);
                 }
+
+                // Callback один раз на сообщение — после применения всех дельт
+                OrderBook book;
+                book.ts     = std::chrono::system_clock::now();
+                book.symbol = symbol_from_string(sym_str);
+                for (auto& [p, r] : bids_map) book.bids.push_back(r);
+                for (auto& [p, r] : asks_map) book.asks.push_back(r);
+                callback(book);
+
                 bo.reset();
             }
             stream->Finish();
@@ -319,7 +333,7 @@ SubscriptionHandle MarketDataClient::subscribe_order_book(
     });
 }
 
-// ── subscribe_latest_trades ───────────────────────────────────────────────────────────
+// ── subscribe_latest_trades ───────────────────────────────────────────────────────────────────────
 
 SubscriptionHandle MarketDataClient::subscribe_latest_trades(
     const Symbol&  symbol,
@@ -381,7 +395,7 @@ SubscriptionHandle MarketDataClient::subscribe_latest_trades(
     });
 }
 
-// ── subscribe_book_events ───────────────────────────────────────────────────────────────
+// ── subscribe_book_events ───────────────────────────────────────────────────────────────────────────
 
 SubscriptionHandle MarketDataClient::subscribe_book_events(
     const Symbol&     symbol,
