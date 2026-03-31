@@ -9,10 +9,12 @@
 
 // ──────────────────────────────────────────────────────────────────────────
 // connectivity_check:
-//   1. Auth
-//   2. GetAccount (equity)
-//   3. Exchanges() — все MIC-коды доступных бирж
-//   4. GetAsset для набора кандидатов Si-фьючерса (разные MIC и тикеры)
+//   Exchanges() показал: срочный рынок MOEX = mic=RTSX
+//   ("MOSCOW EXCHANGE - DERIVATIVES MARKET")
+//   FORTS — не MIC в этом API, правильный MIC: RTSX
+//
+//   Текущий квартал июнь 2026 — буква M
+//   Форматы тикера FORTS: {ROOT}{LETTER}{YY}, напр.: SiM6, RIM6, GDM6
 // ──────────────────────────────────────────────────────────────────────────
 
 static finam::Result<void> check_account(const finam::auth::TokenManager& mgr) {
@@ -25,7 +27,7 @@ static finam::Result<void> check_account(const finam::auth::TokenManager& mgr) {
     A::GetAccountResponse resp;
     if (const auto st = stub->GetAccount(&ctx, req, &resp); !st.ok())
         return std::unexpected(finam::Error{finam::ErrorCode::RpcError, st.error_message()});
-    spdlog::info("[2/4] equity={}", resp.equity().value());
+    spdlog::info("equity={}", resp.equity().value());
     return {};
 }
 
@@ -39,53 +41,38 @@ int main() {
     auto mgr = std::make_shared<finam::auth::TokenManager>(
         finam::auth::TokenManagerConfig{.endpoint="api.finam.ru:443", .use_tls=true});
 
-    spdlog::info("[1/4] Auth...");
     if (auto r = mgr->init(secret_env); !r) {
-        spdlog::critical("[1/4] FAIL: {}", r.error().message); return 1;
+        spdlog::critical("Auth FAIL: {}", r.error().message); return 1;
     }
-    spdlog::info("[1/4] OK  account_id={}", mgr->primary_account_id());
-
+    spdlog::info("Auth OK  account_id={}", mgr->primary_account_id());
     if (auto r = check_account(*mgr); !r) {
-        spdlog::critical("[2/4] FAIL: {}", r.error().message); return 1;
+        spdlog::critical("GetAccount FAIL: {}", r.error().message); return 1;
     }
 
     namespace AS = ::grpc::tradeapi::v1::assets;
     auto stub = AS::AssetsService::NewStub(mgr->channel());
 
-    // ── 3. Exchanges — все доступные MIC коды ────────────────────────────
-    {
-        grpc::ClientContext ctx;
-        ctx.AddMetadata("authorization", "Bearer " + mgr->jwt());
-        AS::ExchangesRequest req;
-        AS::ExchangesResponse resp;
-        const auto st = stub->Exchanges(&ctx, req, &resp);
-        if (!st.ok()) {
-            spdlog::error("[3/4] Exchanges FAIL: {}", st.error_message());
-        } else {
-            spdlog::info("[3/4] Exchanges: {} бирж:", resp.exchanges_size());
-            for (const auto& e : resp.exchanges())
-                spdlog::info("  mic={:<20s}  name={}", e.mic(), e.name());
-        }
-    }
-
-    // ── 4. Проба GetAsset для Si: разные MIC + тикеры ────────────────
-    // Буквы кварталов: H=март, M=июнь, U=сентябрь, Z=декабрь
-    // Текущий квартал июнь 2026
-    const std::vector<std::string> si_candidates = {
-        // формат ticker@MIC с разными MIC-кодами
-        "SiM6@FORTS",  "SIM6@FORTS",  "SiM26@FORTS", "SIM26@FORTS",
-        "Si-6.26@FORTS",
-        // возможные альтернативные MIC
-        "SiM6@RFUD",   "SiM6@SPBFUT", "SiM6@SPBX",
-        "SiM6@MOEX",   "SiM6@XMOS",
-        // без года
-        "SiM@FORTS",   "Si-M@FORTS",
-        // полная дата
-        "Si-6.2026@FORTS",
+    // ── Проба GetAsset: mic=RTSX, разные форматы тикера ──────────────────
+    // Июнь 2026 = квартал M, год 26
+    const std::vector<std::string> candidates = {
+        // RTSX + разные форматы
+        "SiM6@RTSX",    "SIM6@RTSX",
+        "SiM26@RTSX",   "SIM26@RTSX",
+        "Si-6.26@RTSX",
+        // RUSX (ещё один кандидат)
+        "SiM6@RUSX",    "SIM6@RUSX",
+        // Также пробуем RTS и GOLD с RTSX
+        "RIM6@RTSX",    "RITM6@RTSX",  "RiM6@RTSX",
+        "GDM6@RTSX",    "GOLDM6@RTSX",
+        "MXM6@RTSX",    "BRM6@RTSX",
+        // ещё попробуем через MISX (вдруг срочный рынок под одним MIC)
+        "SiM6@MISX",
     };
 
-    spdlog::info("[4/4] GetAsset проба для Si:");
-    for (const auto& sym : si_candidates) {
+    spdlog::info("");
+    spdlog::info("══ GetAsset проба (mic=RTSX): ══");
+    bool any_ok = false;
+    for (const auto& sym : candidates) {
         grpc::ClientContext ctx;
         ctx.AddMetadata("authorization", "Bearer " + mgr->jwt());
         AS::GetAssetRequest req;
@@ -94,16 +81,23 @@ int main() {
         AS::GetAssetResponse resp;
         const auto st = stub->GetAsset(&ctx, req, &resp);
         if (st.ok()) {
-            spdlog::info("  ✔ symbol={} => board={} ticker={} mic={} type={} decimals={} expiry={}-{}-{}",
+            spdlog::info("  ✔ symbol={:<25s} board={} ticker={} mic={} type={} lot={} decimals={} expiry={}-{}-{}",
                 sym, resp.board(), resp.ticker(), resp.mic(), resp.type(),
-                resp.decimals(),
+                resp.lot_size().value(), resp.decimals(),
                 resp.expiration_date().year(),
                 resp.expiration_date().month(),
                 resp.expiration_date().day());
+            any_ok = true;
         } else {
-            spdlog::info("  ✗ {} => {}", sym, st.error_message());
+            spdlog::info("  ✗ {:<25s} => {}", sym, st.error_message());
         }
     }
 
-    return 0;
+    if (!any_ok) {
+        spdlog::warn("");
+        spdlog::warn("Ни один кандидат не сработал.");
+        spdlog::warn("Попробуй AllAssets с mic=RTSX через пагинацию — добавь фильтр в коде");
+    }
+
+    return any_ok ? 0 : 1;
 }
