@@ -76,11 +76,12 @@ public:
 private:
     static constexpr std::size_t kMask = N - 1;
 
-    // Разделяем head_ и tail_ на разные cache lines (false sharing prevention)
+    // Разделяем head_, tail_ и buffer_ на разные cache lines.
+    // FIX: добавлен alignas(64) к buffer_ — без него buffer_[0] лежал
+    //      на той же cacheline что и tail_, создавая false sharing.
     alignas(64) std::atomic<std::size_t> head_{0};
     alignas(64) std::atomic<std::size_t> tail_{0};
-
-    std::array<T, N> buffer_{};
+    alignas(64) std::array<T, N>         buffer_{};
 };
 
 } // namespace finam::core

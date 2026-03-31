@@ -15,7 +15,7 @@ using MarketEvent = std::variant<Quote, Bar, OrderBook, OrderUpdate>;
 // Consumer: Strategy-поток (event loop)
 //
 // Capacity должен быть степенью двойки — маска вместо модуля.
-// Cacheline padding между head/tail — устраняет false sharing.
+// Cacheline padding между head/tail/buffer — устраняет false sharing.
 //
 template<std::size_t Capacity>
     requires (Capacity >= 2 && (Capacity & (Capacity - 1)) == 0)  // pow2
@@ -54,11 +54,11 @@ public:
 private:
     static constexpr std::size_t kMask = Capacity - 1;
 
-    // Padding между head и tail — разные cacheline, нет false sharing
-    alignas(64) std::atomic<std::size_t> head_{0};
-    alignas(64) std::atomic<std::size_t> tail_{0};
-
-    std::array<MarketEvent, Capacity> buffer_;
+    // FIX: добавлен alignas(64) к buffer_ — устраняет false sharing с tail_.
+    // FIX: добавлен {} инициализатор — безопасно при добавлении non-trivial типов в variant.
+    alignas(64) std::atomic<std::size_t>      head_{0};
+    alignas(64) std::atomic<std::size_t>      tail_{0};
+    alignas(64) std::array<MarketEvent, Capacity> buffer_{};
 };
 
 // ── Конкретный тип шины для бота ──────────────────────────────────────────────
