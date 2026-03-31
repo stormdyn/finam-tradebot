@@ -16,38 +16,23 @@
 #include "risk/risk_manager.hpp"
 #include "strategy/strategy_runner.hpp"
 
-// ── Graceful shutdown ─────────────────────────────────────────────────────────
-//
-// FIX: POSIX гарантирует async-signal safety только для volatile sig_atomic_t.
-// std::atomic<bool>::store() в signal handler — формально UB по C++ стандарту.
-// Решение: sig_atomic_t как primary флаг (безопасен в handler), std::atomic<bool>
-// как secondary для корректного happens-before в main loop.
-
 static volatile sig_atomic_t g_shutdown_signal = 0;
 static std::atomic<bool>     g_shutdown{false};
 
 static void signal_handler(int) noexcept {
-    g_shutdown_signal = 1;  // async-signal-safe
+    g_shutdown_signal = 1;
     g_shutdown.store(true, std::memory_order_relaxed);
 }
 
-// ── Logging ───────────────────────────────────────────────────────────────────
-// Two sinks: stdout (color) + rotating file (5×10 MB).
-
 static void setup_logging(bool debug_mode) {
-    const auto level = debug_mode
-        ? spdlog::level::debug
-        : spdlog::level::info;
-
+    const auto level = debug_mode ? spdlog::level::debug : spdlog::level::info;
     auto console = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
     console->set_level(level);
     console->set_pattern("[%H:%M:%S.%e] [%^%l%$] [%t] %v");
-
     auto file = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
         "logs/tradebot.log", 10ULL * 1024 * 1024, 5);
     file->set_level(spdlog::level::debug);
     file->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [%t] %v");
-
     auto logger = std::make_shared<spdlog::logger>(
         "main", spdlog::sinks_init_list{console, file});
     logger->set_level(spdlog::level::debug);
@@ -55,13 +40,8 @@ static void setup_logging(bool debug_mode) {
     spdlog::flush_on(spdlog::level::warn);
 }
 
-// ── DryRunExecutor ────────────────────────────────────────────────────────────
-// Logs orders without sending them to the exchange.
-
 class DryRunExecutor final : public finam::IOrderExecutor {
 public:
-    // FIX: int64_t — приведено в соответствие с IOrderExecutor::submit и
-    // Finam API (order_no — всегда 64-bit integer).
     finam::Result<int64_t> submit(const finam::OrderRequest& req) override {
         spdlog::info("[DryRun] SUBMIT symbol={} side={} type={} qty={} price={}",
             req.symbol.to_string(),
@@ -75,45 +55,67 @@ public:
         return {};
     }
 private:
-    int64_t id_{0};  // FIX: int64_t вместо int32_t
+    int64_t id_{0};
 };
 
-// ── SymbolConfig ──────────────────────────────────────────────────────────────
-// Per-symbol trading parameters. Add/remove entries in make_symbol_configs().
-
-struct SymbolConfig {
-    std::string  ticker;        // "Si", "RTS", "GOLD", "MIX"
-    double       tick_size;     // tick size in roubles
-    int32_t      base_qty;      // contracts per signal
-    double       sl_ticks;      // stop-loss in ticks
-    double       tp_ticks;      // take-profit in ticks
-    int          rollover_days; // days before expiry to roll
-};
-
-// ── Active symbol list ────────────────────────────────────────────────────────
-// Edit here to add or remove instruments. Symbols not listed are ignored.
+// ── Настройка инструментов ─────────────────────────────────────────────────────
 //
-// Tradeoff: static config vs runtime JSON — static is simpler, safer,
-// and avoids parsing errors on startup. Recompilation takes <30s.
+// ticker     — ROOT-часть тикера (перед буквой квартала)
+// tick_size  — шаг цены в единицах котировки (lot_size/decimals из GetAsset)
+// base_qty   — контрактов на сигнал
+// sl_ticks   — стоп-лосс в тиках
+// tp_ticks   — тейк-профит в тиках
+// rollover   — дней до экспирации для ролловера
+//
+// Тикеры и параметры подтверждены через GetAsset (expiry, decimals, lot).
+// MIC = RTSX («МОСКОВСКАЯ БИРЖА — СРОЧНЫЙ РЫНОК»)
+//
+//  ──────────────────────────────────────────────────────────────────────────
+//  ticker  tick    qty  sl     tp    roll   комментарий (board=FUT)
+struct SymbolConfig {
+    std::string  ticker;
+    double       tick_size;
+    int32_t      base_qty;
+    double       sl_ticks;
+    double       tp_ticks;
+    int          rollover_days;
+};
 
 static std::vector<SymbolConfig> make_symbol_configs() {
     return {
-        // ticker   tick   qty  sl    tp    roll
-        { "Si",    1.0,    1,  30.0, 90.0,  5 },
-        { "RTS",   10.0,   1,  30.0, 90.0,  5 },
-        { "GOLD",  1.0,    1,  30.0, 90.0,  5 },
-        // { "MIX",  0.05,  1,  30.0, 90.0,  5 },  // uncomment to enable
+        //── ВАЛЮТНЫЕ ────────────────────────────────────────────────────────
+        { "Si",   1.0,   1,  30.0,  90.0,  5 }, // USD/RUB   SiM6@RTSX
+        { "Eu",   1.0,   1,  30.0,  90.0,  5 }, // EUR/RUB   EuM6@RTSX
+        { "Cn",   0.001, 1,  30.0,  90.0,  5 }, // CNY/RUB   CnM6@RTSX
+        //── ИНДЕКСЫ ───────────────────────────────────────────────────────
+        { "RI",   10.0,  1,  30.0,  90.0,  5 }, // Индекс РТС   RIM6@RTSX
+        { "MX",   0.05,  1,  30.0,  90.0,  5 }, // Индекс МОСБИРЖИ MXM6@RTSX
+        //── ТОВАРЫ ─────────────────────────────────────────────────────────
+        { "GD",   1.0,   1,  30.0,  90.0,  5 }, // Золото     GDM6@RTSX
+        { "BR",   0.01,  1,  30.0,  90.0,  5 }, // Нефть Brent BRM6@RTSX
+        { "Ng",   0.001, 1,  30.0,  90.0,  5 }, // Газ природный NgM6@RTSX
+        { "SV",   1.0,   1,  30.0,  90.0,  5 }, // Серебро    SVM6@RTSX
+        { "PL",   0.1,   1,  30.0,  90.0,  5 }, // Платина    PLM6@RTSX
+        { "Cu",   10.0,  1,  30.0,  90.0,  5 }, // Медь      CuM6@RTSX
+        { "Al",   5.0,   1,  30.0,  90.0,  5 }, // Алюминий  AlM6@RTSX
+        //── АКЦИИ ─────────────────────────────────────────────────────────
+        { "GZ",   1.0,   1,  30.0,  90.0,  5 }, // Газпром    GZM6@RTSX
+        { "LK",   1.0,   1,  30.0,  90.0,  5 }, // ЛУКОЙЛ    LKM6@RTSX
+        { "SR",   0.5,   1,  30.0,  90.0,  5 }, // Сбербанк   SRM6@RTSX
+        { "VB",   0.001, 1,  30.0,  90.0,  5 }, // ВТБ      VBM6@RTSX
+        { "RN",   1.0,   1,  30.0,  90.0,  5 }, // Роснефть  RNM6@RTSX
+        { "GM",   1.0,   1,  30.0,  90.0,  5 }, // ГМК-НОР    GMM6@RTSX (ГМК)
+        { "Ym",   0.1,   1,  30.0,  90.0,  5 }, // Золото/Рубь YmM6@RTSX (GLDRUB)
     };
 }
 
 int main(int argc, char* argv[]) {
-    // ── CLI args ──────────────────────────────────────────────────────────────
     bool dry_run    = false;
     bool debug_mode = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg{argv[i]};
-        if (arg == "--dry-run") { dry_run    = true; }
-        if (arg == "--debug")   { debug_mode = true; }
+        if (arg == "--dry-run") dry_run    = true;
+        if (arg == "--debug")   debug_mode = true;
     }
 
     setup_logging(debug_mode);
@@ -124,14 +126,12 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    // ── Env ───────────────────────────────────────────────────────────────────
     const char* secret_env = std::getenv("FINAM_SECRET_TOKEN");
     if (!secret_env) {
         spdlog::critical("FINAM_SECRET_TOKEN not set");
         return 1;
     }
 
-    // ── Auth ──────────────────────────────────────────────────────────────────
     auto token_mgr = std::make_shared<finam::auth::TokenManager>(
         finam::auth::TokenManagerConfig{.endpoint = "api.finam.ru:443", .use_tls = true}
     );
@@ -142,13 +142,12 @@ int main(int argc, char* argv[]) {
     const std::string account_id{token_mgr->primary_account_id()};
     spdlog::info("Authenticated, account: {}", account_id);
 
-    // ── Risk ──────────────────────────────────────────────────────────────────
     auto risk = std::make_shared<finam::risk::RiskManager>(
         finam::risk::RiskConfig{
             .per_trade_pct      = 2.0,
             .max_daily_loss_pct = 5.0,
             .max_drawdown_pct   = 15.0,
-            .max_positions      = 3,
+            .max_positions      = 5,
             .require_stop_loss  = true,
             .rollover_days      = 5,
         },
@@ -156,10 +155,8 @@ int main(int argc, char* argv[]) {
     );
     risk->start();
 
-    // ── Market data ───────────────────────────────────────────────────────────
     auto md = std::make_shared<finam::market_data::MarketDataClient>(token_mgr);
 
-    // ── Executor ──────────────────────────────────────────────────────────────
     std::shared_ptr<finam::IOrderExecutor>     executor;
     std::shared_ptr<finam::order::OrderClient> order_client;
     if (dry_run) {
@@ -170,7 +167,6 @@ int main(int argc, char* argv[]) {
         executor     = order_client;
     }
 
-    // ── Strategy runners (one per symbol) ────────────────────────────────────
     const auto symbol_cfgs = make_symbol_configs();
     std::vector<std::unique_ptr<finam::strategy::StrategyRunner>> runners;
     runners.reserve(symbol_cfgs.size());
@@ -201,22 +197,19 @@ int main(int argc, char* argv[]) {
     if (order_client) {
         std::vector<finam::order::OrderUpdateCallback> cbs;
         cbs.reserve(runners.size());
-        for (auto& r : runners) {
-            cbs.push_back(r->make_order_callback());
-        }
+        for (auto& r : runners) cbs.push_back(r->make_order_callback());
         order_client->set_update_callback(
             [cbs = std::move(cbs)](const finam::OrderUpdate& upd) {
-                for (const auto& cb : cbs) { cb(upd); }
+                for (const auto& cb : cbs) cb(upd);
             }
         );
     }
 
-    // ── Health server ─────────────────────────────────────────────────────────
     finam::core::HealthServer health{8080, [&] {
         const auto st = risk->account_state();
         std::string symbols;
         for (const auto& sc : symbol_cfgs) {
-            if (!symbols.empty()) { symbols += ','; }
+            if (!symbols.empty()) symbols += ',';
             symbols += sc.ticker;
         }
         return finam::core::HealthStatus{
@@ -232,17 +225,13 @@ int main(int argc, char* argv[]) {
     spdlog::info("Bot running: {} instruments, health=http://localhost:8080/health",
         runners.size());
 
-    // ── Main loop ─────────────────────────────────────────────────────────────
-    // FIX: проверяем оба флага — sig_atomic_t (async-signal-safe) и atomic<bool>
-    // (memory_order_acquire для корректного happens-before с другими потоками).
     while (!g_shutdown_signal && !g_shutdown.load(std::memory_order_acquire))
         std::this_thread::sleep_for(std::chrono::seconds{1});
 
-    // ── Graceful shutdown ─────────────────────────────────────────────────────
     spdlog::info("Shutting down {} runners...", runners.size());
     health.stop();
     runners.clear();
-    if (order_client) { order_client->shutdown(); }
+    if (order_client) order_client->shutdown();
     risk->shutdown();
     token_mgr->shutdown();
     spdlog::info("finam-tradebot stopped");
