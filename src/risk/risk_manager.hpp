@@ -5,12 +5,10 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <core/interfaces.hpp>
 #include <auth/token_manager.hpp>
-
-namespace grpc::tradeapi::v1::assets   { class AssetsService;   }
-namespace grpc::tradeapi::v1::accounts { class AccountsService; }
 
 namespace finam::risk {
 

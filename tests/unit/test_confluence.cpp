@@ -7,7 +7,7 @@ using namespace std::chrono_literals;
 
 static ConfluenceStrategy::Config make_cfg() {
     return ConfluenceStrategy::Config{
-        .symbol    = Symbol{"Si-6.26", "FORTS"},
+        .symbol    = Symbol{"SiM6", "RTSX"},
         .base_qty  = 1,
         .sl_ticks  = 30.0,
         .tp_ticks  = 90.0,
@@ -17,7 +17,7 @@ static ConfluenceStrategy::Config make_cfg() {
 
 static Bar make_d1(double o, double h, double l, double c) {
     return Bar{
-        .symbol    = Symbol{"Si-6.26", "FORTS"},
+        .symbol    = Symbol{"SiM6", "RTSX"},
         .timeframe = "D1",
         .open = o, .high = h, .low = l, .close = c,
         .volume    = 1000,
@@ -39,7 +39,7 @@ TEST_CASE("ConfluenceStrategy: SL closes long position", "[confluence]") {
 
     // Цена упала на > sl_ticks (30) тиков
     Quote q{
-        .symbol = Symbol{"Si-6.26", "FORTS"},
+        .symbol = Symbol{"SiM6", "RTSX"},
         .bid    = 69.0, .ask = 70.0,
         .ts     = std::chrono::system_clock::now(),
     };
@@ -61,7 +61,7 @@ TEST_CASE("ConfluenceStrategy: TP closes long position", "[confluence]") {
     strat.on_order_update(fill);
 
     Quote q{
-        .symbol = Symbol{"Si-6.26", "FORTS"},
+        .symbol = Symbol{"SiM6", "RTSX"},
         .bid    = 191.0, .ask = 192.0,  // pnl > tp_ticks (90)
         .ts     = std::chrono::system_clock::now(),
     };
