@@ -5,16 +5,16 @@
 
 namespace finam::core {
 
-// ── nearest_contract ──────────────────────────────────────────────────────────
+// ── nearest_contract ──────────────────────────────────────────────────────────────
 //
 // Реальный формат Finam Trade API (подтверждён через GetAsset):
-//   symbol = "{ROOT}{LETTER}{YY}@RTSX"
+//   symbol = "{ROOT}{LETTER}{Y}@RTSX"
 //   MIC    = RTSX  («МОСКОВСКАЯ БИРЖА — СРОЧНЫЙ РЫНОК»)
 //   LETTER = H(март) M(июнь) U(сентябрь) Z(декабрь)
-//   YY     = последние 2 цифры года
+//   Y      = последняя одна цифра года (6 для 2026, 7 для 2027, и т.)
 //
 // Примеры: SiM6@RTSX, RIM6@RTSX, GDM6@RTSX, MXM6@RTSX, BRM6@RTSX
-// СТАРЫЙ формат Si-6.26@FORTS — НЕРАБОЧИЙ, API его не знает!
+// СТАРЫЙ формат Si-6.26@FORTS — НЕРАБОЧИЙ!
 
 // Третья пятница месяца (C++20 chrono)
 [[nodiscard]] inline int third_friday(int year, int month) noexcept {
@@ -87,25 +87,27 @@ inline void next_quarterly(int& month, int& year) noexcept {
         next_quarterly(exp_month, exp_year);
     }
 
-    // Формат: {ROOT}{LETTER}{YY}  напр.: SiM6, RIM6, GDM6
-    const int  yy     = exp_year % 100;
-    const char letter = quarter_letter(exp_month);
+    // Формат: {ROOT}{LETTER}{Y}  напр.: SiM6, RIM6, GDM6
+    // Y = последняя одна цифра года (MOEX кодирует год одной цифрой)
+    const int  y_digit = exp_year % 10;
+    const char letter  = quarter_letter(exp_month);
     const std::string code = std::string(ticker)
         + letter
-        + (yy < 10 ? "0" : "") + std::to_string(yy);
+        + std::to_string(y_digit);
 
     return Symbol{code, "RTSX"};
 }
 
-// День экспирации по символу ({ROOT}{LETTER}{YY}@RTSX)
+// День экспирации по символу ({ROOT}{LETTER}{Y}@RTSX)
+// Предполагаем декаду 2020-2029 (достаточно для production до 2030)
 [[nodiscard]] inline int expiry_day(const Symbol& sym) noexcept {
     const auto& code = sym.security_code;
-    if (code.size() < 3) return 0;
-    const char letter = code[code.size() - 3];  // предпоследние 3 символа = LETTER + YY
-    // YY — последние 2 символа
+    if (code.size() < 2) return 0;
+    // Последний символ = цифра года, предпоследний = буква квартала
+    const char letter = code[code.size() - 2];
     try {
-        const int yy   = std::stoi(code.substr(code.size() - 2));
-        const int year = 2000 + yy;
+        const int y_digit = code.back() - '0';
+        const int year    = 2020 + y_digit;  // достаточно до 2030
         int month = 0;
         switch (letter) {
             case 'H': month = 3;  break;
